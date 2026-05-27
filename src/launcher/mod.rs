@@ -1,0 +1,530 @@
+pub mod events;
+pub mod game_data;
+pub mod options;
+
+pub use events::LaunchEvent;
+
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::time::Duration;
+
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::mpsc::Sender;
+
+use crate::error::LaunchError;
+use crate::game::{
+    arguments::{get_classpath, get_game_arguments, get_jvm_arguments, LoaderContext},
+    assets::{copy_assets, get_assets},
+    bundle::{check_bundle, check_files},
+    java::get_java_files,
+    libraries::{extract_natives, get_assets_others, get_libraries},
+    version::get_version_json,
+};
+use crate::launcher::game_data::{load_game_data, save_game_data, GameData, JavaInfo};
+use crate::launcher::options::LaunchOptions;
+use crate::loader::{create_loader, types::LoaderInstallInput};
+use crate::models::loader::LoaderType;
+use crate::models::minecraft::AssetItem;
+use crate::net::check::check_internet;
+use crate::net::downloader::Downloader;
+use crate::utils::version_check::is_old;
+
+// ── Launcher ──────────────────────────────────────────────────────────────────
+
+pub struct Launcher {
+    options: LaunchOptions,
+}
+
+impl Launcher {
+    pub fn new(options: LaunchOptions) -> Self {
+        Self { options }
+    }
+
+    pub fn options(&self) -> &LaunchOptions {
+        &self.options
+    }
+
+    /// Download, verify, and optionally install a mod loader for the configured
+    /// Minecraft version.
+    ///
+    /// Emits progress events on `event_tx`. Returns a `GameData` that can be
+    /// passed directly to [`Launcher::launch`].
+    ///
+    /// If there is no internet connection and a valid cache exists, the cache
+    /// is returned without network access. If there is no cache either, returns
+    /// [`LaunchError::NoInternetNoCache`].
+    pub async fn download_game(
+        &self,
+        event_tx: Sender<LaunchEvent>,
+    ) -> Result<GameData, LaunchError> {
+        let options = &self.options;
+
+        // ── Offline fast-path ─────────────────────────────────────────────────
+        if !check_internet().await {
+            return load_game_data(&options.save_dir())
+                .await
+                .map_err(|_| LaunchError::NoInternetNoCache);
+        }
+
+        // ── Shared HTTP client ────────────────────────────────────────────────
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(options.timeout_secs))
+            .build()
+            .map_err(LaunchError::Http)?;
+
+        // ── Version JSON ──────────────────────────────────────────────────────
+        let mut version_json = get_version_json(options, &client).await?;
+        let mc_version = version_json.id.clone();
+
+        // ── File bundle ───────────────────────────────────────────────────────
+        let mut bundle: Vec<AssetItem> = Vec::new();
+        bundle.extend(get_libraries(options, &version_json));
+        bundle.extend(get_assets_others(options, options.url.as_deref(), &client).await?);
+        bundle.extend(get_assets(options, &version_json, &client).await?);
+
+        // Java runtime download is managed separately (has its own concurrency
+        // and progress reporting); its files are not added to the bundle.
+        let java_result = get_java_files(options, &version_json, &client, &event_tx).await?;
+
+        // ── Bundle integrity check & download ─────────────────────────────────
+        let pending = check_bundle(&bundle, &event_tx).await?;
+        if !pending.is_empty() {
+            let downloader = Downloader::new(options.timeout_secs, options.download_concurrency);
+            downloader
+                .download_multiple(pending, event_tx.clone())
+                .await?;
+        }
+
+        let _ = event_tx.send(LaunchEvent::GameDownloadFinished).await;
+
+        // ── Mod loader install ────────────────────────────────────────────────
+        let (loader_libraries, loader_main_class, loader_version_id, loader_type, loader_extra_game_args, loader_extra_jvm_args) = if options.loader.enable {
+            if let Some(loader_type) = &options.loader.loader_type {
+                let mc_jar = options
+                    .path
+                    .join("versions")
+                    .join(&mc_version)
+                    .join(format!("{mc_version}.jar"))
+                    .to_string_lossy()
+                    .into_owned();
+                let mc_json = options
+                    .path
+                    .join("versions")
+                    .join(&mc_version)
+                    .join(format!("{mc_version}.json"))
+                    .to_string_lossy()
+                    .into_owned();
+
+                let input = LoaderInstallInput {
+                    mc_version: mc_version.clone(),
+                    java_path: java_result.java_path.clone(),
+                    mc_jar,
+                    mc_json,
+                };
+
+                let loader_impl = create_loader(loader_type.clone());
+                let result = loader_impl.install(options, &input, &client, &event_tx).await?;
+                (result.libraries, result.main_class, Some(result.loader_version), Some(result.loader_type), result.extra_game_args, result.extra_jvm_args)
+            } else {
+                (vec![], None, None, None, vec![], vec![])
+            }
+        } else {
+            (vec![], None, None, None, vec![], vec![])
+        };
+
+        // ── Download Forge/NeoForge runtime libraries ─────────────────────────
+        // The loader install step (above) downloads processor/install-time JARs
+        // but NOT the runtime classpath libraries listed in version.json (e.g.
+        // bootstraplauncher, securejarhandler, modlauncher).  We check and
+        // download them here.  When --installClient was used the files already
+        // exist and check_bundle returns an empty pending list immediately.
+        if !loader_libraries.is_empty() {
+            let loader_pending = check_bundle(&loader_libraries, &event_tx).await?;
+            if !loader_pending.is_empty() {
+                let downloader =
+                    Downloader::new(options.timeout_secs, options.download_concurrency);
+                downloader
+                    .download_multiple(loader_pending, event_tx.clone())
+                    .await?;
+            }
+        }
+
+        // ── Optional post-download SHA-1 verify ───────────────────────────────
+        if options.verify {
+            check_files(&bundle, &event_tx).await?;
+        }
+
+        // ── Extract native JARs ───────────────────────────────────────────────
+        extract_natives(options, &version_json, &bundle).await?;
+        version_json.has_natives = bundle
+            .iter()
+            .any(|item| matches!(item, AssetItem::NativeAsset { .. }));
+
+        // ── Legacy asset copy (pre-1.6) ───────────────────────────────────────
+        if is_old(version_json.assets.as_deref()) {
+            copy_assets(options, &version_json).await?;
+        }
+
+        // ── Persist & return ──────────────────────────────────────────────────
+        let game_data = GameData {
+            minecraft_json: version_json,
+            minecraft_loader: None,
+            minecraft_version: mc_version,
+            minecraft_java: JavaInfo {
+                files: java_result.files,
+                path: java_result.java_path,
+            },
+            loader_libraries,
+            loader_main_class,
+            loader_version_id,
+            loader_type,
+            loader_extra_game_args,
+            loader_extra_jvm_args,
+        };
+
+        save_game_data(&options.save_dir(), &game_data).await?;
+
+        Ok(game_data)
+    }
+
+    /// Assemble the Java command line and spawn the Minecraft process.
+    ///
+    /// Stdout and stderr are piped; each line is forwarded as a
+    /// [`LaunchEvent::Data`] event. The caller is responsible for calling
+    /// `child.wait()` and emitting [`LaunchEvent::Close`] when appropriate.
+    pub async fn launch(
+        &self,
+        game_data: &GameData,
+        event_tx: Sender<LaunchEvent>,
+    ) -> Result<tokio::process::Child, LaunchError> {
+        let options = &self.options;
+        let version_json = &game_data.minecraft_json;
+
+        // Natives directory used for -Djava.library.path.
+        let natives_path: PathBuf = options
+            .path
+            .join("versions")
+            .join(&version_json.id)
+            .join("natives");
+
+        // Build the classpath: loader libraries FIRST so Forge/NeoForge classes
+        // take precedence over vanilla when there are collisions.
+        let mut bundle: Vec<AssetItem> = game_data.loader_libraries.clone();
+        let mut vanilla_libs = get_libraries(options, version_json);
+        // Forge/NeoForge: exclude the vanilla Minecraft client JAR from the classpath.
+        // The bootstraplauncher manages Minecraft classes via client-slim.jar in its
+        // library directory. Including the full vanilla jar causes split-package
+        // conflicts in the Java module layer (_1._20._1 vs minecraft modules).
+        if matches!(game_data.loader_type, Some(LoaderType::Forge) | Some(LoaderType::NeoForge)) {
+            let mc_jar = options
+                .path
+                .join("versions")
+                .join(&version_json.id)
+                .join(format!("{}.jar", version_json.id))
+                .to_string_lossy()
+                .into_owned();
+            vanilla_libs.retain(|lib| !matches!(lib, AssetItem::Asset { path, .. } if path == &mc_jar));
+        }
+        bundle.extend(vanilla_libs);
+
+        // Argument assembly.
+        let loader_ctx = game_data.loader_version_id.as_ref().map(|vid| LoaderContext {
+            loader_type: game_data.loader_type.as_ref(),
+            version_id: Some(vid.as_str()),
+            extra_game_args: &game_data.loader_extra_game_args,
+            extra_jvm_args: &game_data.loader_extra_jvm_args,
+        });
+        let jvm_args = get_jvm_arguments(options, version_json, &natives_path, loader_ctx.as_ref());
+        let mut game_args = get_game_arguments(options, version_json, loader_ctx.as_ref());
+        let (cp_args, vanilla_main_class) = get_classpath(version_json, &bundle);
+
+        // Screen size / fullscreen (conditional args from the version JSON are
+        // skipped by get_game_arguments, so we add them here explicitly).
+        if let Some(w) = options.screen.width {
+            game_args.push("--width".into());
+            game_args.push(w.to_string());
+        }
+        if let Some(h) = options.screen.height {
+            game_args.push("--height".into());
+            game_args.push(h.to_string());
+        }
+        if options.screen.fullscreen {
+            game_args.push("--fullscreen".into());
+        }
+
+        let main_class = game_data
+            .loader_main_class
+            .as_deref()
+            .unwrap_or(&vanilla_main_class)
+            .to_owned();
+
+        // Collect JARs on the Java module path (-p flag) from JVM args so we
+        // can exclude them from -cp. NeoForge places bootstrap JARs on the
+        // module path; having them on both paths causes IllegalStateException.
+        let module_path_jars: std::collections::HashSet<String> = {
+            let mut set = std::collections::HashSet::new();
+            let mut iter = jvm_args.iter().peekable();
+            while let Some(arg) = iter.next() {
+                if arg == "-p" {
+                    if let Some(module_path) = iter.next() {
+                        for jar in module_path.split(':') {
+                            // Normalize to a canonical filename for matching.
+                            if let Some(name) = std::path::Path::new(jar).file_name() {
+                                set.insert(name.to_string_lossy().into_owned());
+                            }
+                        }
+                    }
+                }
+            }
+            set
+        };
+
+        // Filter module-path JARs out of -cp to avoid duplicate module errors.
+        let cp_args = if module_path_jars.is_empty() {
+            cp_args
+        } else {
+            cp_args.into_iter().map(|arg| {
+                // The classpath string is the arg after "-cp".
+                if arg.contains(':') || arg.ends_with(".jar") {
+                    let filtered: Vec<&str> = arg.split(':')
+                        .filter(|entry| {
+                            let fname = std::path::Path::new(entry)
+                                .file_name()
+                                .map(|f| f.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            !module_path_jars.contains(&fname)
+                        })
+                        .collect();
+                    filtered.join(":")
+                } else {
+                    arg
+                }
+            }).collect()
+        };
+
+        let mut all_args: Vec<String> = Vec::new();
+        all_args.extend(jvm_args);
+        #[cfg(target_os = "linux")]
+        all_args.push("-DGLFW_PLATFORM=x11".into());
+        all_args.extend(cp_args);
+        all_args.push(main_class);
+        all_args.extend(game_args);
+
+        let java_path = &game_data.minecraft_java.path;
+
+        // Sanitize auth token before logging the command.
+        let access_token = &options.authenticator.access_token;
+        let cmd_str = format!("{} {}", java_path, all_args.join(" "));
+        let sanitized = if access_token.is_empty() {
+            cmd_str
+        } else {
+            cmd_str.replace(access_token.as_str(), "<access_token>")
+        };
+        let _ = event_tx.send(LaunchEvent::Data(sanitized)).await;
+
+        // Spawn the process.
+        let mut cmd = tokio::process::Command::new(java_path);
+        cmd.args(&all_args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        // On Linux, force GLFW 3.4+ to use X11 via XWayland (if available) to
+        // avoid residual [0x1000C] Wayland errors that crash MC's GLFW init check.
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("DISPLAY").is_some() {
+            cmd.env_remove("WAYLAND_DISPLAY");
+            cmd.env("GLFW_PLATFORM", "x11");
+        }
+
+        let mut child = cmd.spawn()
+            .map_err(|e| LaunchError::ProcessError(e.to_string()))?;
+
+        // Pipe stdout lines → LaunchEvent::Data.
+        if let Some(stdout) = child.stdout.take() {
+            let tx = event_tx.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let _ = tx.send(LaunchEvent::Data(line)).await;
+                }
+            });
+        }
+
+        // Pipe stderr lines → LaunchEvent::Data.
+        if let Some(stderr) = child.stderr.take() {
+            let tx = event_tx;
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let _ = tx.send(LaunchEvent::Data(line)).await;
+                }
+            });
+        }
+
+        Ok(child)
+    }
+
+    /// Download the game and immediately launch it.
+    ///
+    /// Equivalent to `download_game` followed by `launch`. Returns the
+    /// [`tokio::process::Child`] handle so the caller can monitor or kill
+    /// the process.
+    ///
+    /// To receive a [`LaunchEvent::Close`] event, wait on the returned child
+    /// and send it yourself:
+    /// ```ignore
+    /// let code = child.wait().await?.code().unwrap_or(-1);
+    /// let _ = tx.send(LaunchEvent::Close(code)).await;
+    /// ```
+    pub async fn start(
+        &self,
+        event_tx: Sender<LaunchEvent>,
+    ) -> Result<tokio::process::Child, LaunchError> {
+        let game_data = self.download_game(event_tx.clone()).await?;
+        self.launch(&game_data, event_tx).await
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn make_options() -> LaunchOptions {
+        use crate::launcher::options::{JavaOptions, LoaderConfig, MemoryConfig, ScreenConfig};
+        use crate::models::minecraft::Authenticator;
+        LaunchOptions {
+            path: PathBuf::from("/mc"),
+            version: "1.20.4".into(),
+            authenticator: Authenticator {
+                access_token: "test-token".into(),
+                name: "Player".into(),
+                uuid: "test-uuid".into(),
+                xbox_account: None,
+                user_properties: None,
+                meta: None,
+                client_id: None,
+                client_token: None,
+            },
+            timeout_secs: 10,
+            download_concurrency: 5,
+            memory: MemoryConfig::default(),
+            java: JavaOptions::default(),
+            loader: LoaderConfig::default(),
+            screen: ScreenConfig::default(),
+            verify: false,
+            game_args: vec![],
+            jvm_args: vec![],
+            instance: None,
+            url: None,
+            mcp: None,
+            intel_enabled_mac: false,
+            bypass_offline: false,
+        }
+    }
+
+    #[test]
+    fn launcher_new_stores_options() {
+        let opts = make_options();
+        let launcher = Launcher::new(opts.clone());
+        assert_eq!(launcher.options.version, "1.20.4");
+        assert_eq!(launcher.options.path, PathBuf::from("/mc"));
+    }
+
+    #[test]
+    fn launcher_save_dir_no_instance() {
+        let opts = make_options();
+        let launcher = Launcher::new(opts);
+        assert_eq!(launcher.options.save_dir(), PathBuf::from("/mc"));
+    }
+
+    #[test]
+    fn launcher_save_dir_with_instance() {
+        let mut opts = make_options();
+        opts.instance = Some("myworld".into());
+        let launcher = Launcher::new(opts);
+        assert_eq!(
+            launcher.options.save_dir(),
+            PathBuf::from("/mc/instances/myworld")
+        );
+    }
+
+    #[test]
+    fn sanitize_replaces_access_token() {
+        let token = "secret-access-token";
+        let cmd = format!("java -cp foo.jar Main --accessToken {token}");
+        let sanitized = cmd.replace(token, "<access_token>");
+        assert!(!sanitized.contains(token));
+        assert!(sanitized.contains("<access_token>"));
+    }
+
+    #[test]
+    fn all_args_order_is_correct() {
+        // Verify the expected CLI ordering: jvm_args, -cp, classpath, main_class, game_args
+        let jvm: Vec<String> = vec!["-Xms1G".into(), "-Xmx2G".into()];
+        let cp: Vec<String> = vec!["-cp".into(), "a.jar:b.jar".into()];
+        let main_class = "net.minecraft.client.main.Main".to_owned();
+        let game: Vec<String> = vec!["--username".into(), "Player".into()];
+
+        let mut all: Vec<String> = Vec::new();
+        all.extend(jvm);
+        all.extend(cp);
+        all.push(main_class.clone());
+        all.extend(game);
+
+        assert_eq!(all[0], "-Xms1G");
+        assert_eq!(all[2], "-cp");
+        assert_eq!(all[4], main_class);
+        assert_eq!(all[5], "--username");
+    }
+
+    #[test]
+    fn screen_args_appended_when_set() {
+        use crate::launcher::options::ScreenConfig;
+        let screen = ScreenConfig { width: Some(1920), height: Some(1080), fullscreen: false };
+        let mut game_args: Vec<String> = vec!["--version".into(), "1.20.4".into()];
+        if let Some(w) = screen.width {
+            game_args.push("--width".into());
+            game_args.push(w.to_string());
+        }
+        if let Some(h) = screen.height {
+            game_args.push("--height".into());
+            game_args.push(h.to_string());
+        }
+        assert!(game_args.contains(&"--width".to_string()));
+        assert!(game_args.contains(&"1920".to_string()));
+        assert!(game_args.contains(&"--height".to_string()));
+        assert!(game_args.contains(&"1080".to_string()));
+        assert!(!game_args.contains(&"--fullscreen".to_string()));
+    }
+
+    #[test]
+    fn screen_fullscreen_appended_when_set() {
+        use crate::launcher::options::ScreenConfig;
+        let screen = ScreenConfig { width: None, height: None, fullscreen: true };
+        let mut game_args: Vec<String> = vec![];
+        if screen.fullscreen {
+            game_args.push("--fullscreen".into());
+        }
+        assert!(game_args.contains(&"--fullscreen".to_string()));
+    }
+
+    #[test]
+    fn loader_main_class_overrides_vanilla() {
+        let vanilla = "net.minecraft.client.main.Main".to_owned();
+        let loader_main_class: Option<String> =
+            Some("net.fabricmc.loader.impl.launch.knot.KnotClient".into());
+        let main_class = loader_main_class.as_deref().unwrap_or(&vanilla).to_owned();
+        assert_eq!(main_class, "net.fabricmc.loader.impl.launch.knot.KnotClient");
+    }
+
+    #[test]
+    fn no_loader_main_class_uses_vanilla() {
+        let vanilla = "net.minecraft.client.main.Main".to_owned();
+        let loader_main_class: Option<String> = None;
+        let main_class = loader_main_class.as_deref().unwrap_or(&vanilla).to_owned();
+        assert_eq!(main_class, "net.minecraft.client.main.Main");
+    }
+}

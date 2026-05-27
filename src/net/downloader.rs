@@ -1,0 +1,304 @@
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use futures::StreamExt;
+use sha1::Digest;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
+
+use crate::error::{DownloadError, LaunchError};
+use crate::launcher::events::LaunchEvent;
+
+// ── DownloadItem ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct DownloadItem {
+    /// Full URL to fetch.
+    pub url: String,
+    /// Absolute path to write the file to.
+    pub path: PathBuf,
+    /// Parent directory; created with `create_dir_all` before writing.
+    /// When empty the parent of `path` is used instead.
+    pub folder: PathBuf,
+    /// Human-readable name used in error messages and progress events.
+    pub name: String,
+    /// Expected file size in bytes (used for progress totals; 0 = unknown).
+    pub size: u64,
+    /// Category label emitted with `LaunchEvent::Progress` (e.g. "assets").
+    #[allow(clippy::pub_with_shorthand)]
+    pub r#type: Option<String>,
+    /// Expected SHA-1 hex digest.  When `Some`, the file is verified after
+    /// download; `DownloadError::ChecksumMismatch` is returned on mismatch.
+    pub sha1: Option<String>,
+}
+
+// ── Downloader ────────────────────────────────────────────────────────────────
+
+pub struct Downloader {
+    client: reqwest::Client,
+    /// Maximum number of simultaneous downloads (clamped ≥ 1).
+    concurrency: usize,
+}
+
+impl Downloader {
+    pub fn new(timeout_secs: u64, concurrency: u32) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(timeout_secs))
+            .build()
+            .expect("failed to build reqwest client");
+        Self {
+            client,
+            concurrency: (concurrency as usize).max(1),
+        }
+    }
+
+    /// Download a single file.  No progress events are emitted.
+    pub async fn download_file(&self, item: &DownloadItem) -> Result<(), LaunchError> {
+        let counter = Arc::new(AtomicU64::new(0));
+        fetch_one(self.client.clone(), item, &counter)
+            .await
+            .map_err(LaunchError::Download)
+    }
+
+    /// Download many files concurrently, emitting `LaunchEvent` progress
+    /// notifications on `event_tx`.
+    ///
+    /// Events emitted:
+    /// - `Progress { downloaded, total, kind }` — file-count progress after
+    ///   each file completes, where `downloaded` = files done, `total` = total
+    ///   files.
+    /// - `Speed(bytes_per_sec)` — rolling 5-second average.
+    /// - `Estimated(secs)` — ETA in seconds at the current speed.
+    pub async fn download_multiple(
+        &self,
+        items: Vec<DownloadItem>,
+        event_tx: tokio::sync::mpsc::Sender<LaunchEvent>,
+    ) -> Result<(), LaunchError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+
+        let total_bytes: u64 = items.iter().map(|i| i.size).sum();
+        let total_count = items.len() as u64;
+        let downloaded = Arc::new(AtomicU64::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+
+        let semaphore = Arc::new(Semaphore::new(self.concurrency));
+        let mut join_set: JoinSet<Result<(), LaunchError>> = JoinSet::new();
+
+        for item in items {
+            let sem = Arc::clone(&semaphore);
+            let dl = Arc::clone(&downloaded);
+            let comp = Arc::clone(&completed);
+            let client = self.client.clone();
+            let tx = event_tx.clone();
+
+            join_set.spawn(async move {
+                let _permit = sem
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| LaunchError::Archive(e.to_string()))?;
+
+                fetch_one(client, &item, &dl)
+                    .await
+                    .map_err(LaunchError::Download)?;
+
+                let done = comp.fetch_add(1, Ordering::Relaxed) as u64 + 1;
+                tx.send(LaunchEvent::Progress {
+                    downloaded: done,
+                    total: total_count,
+                    kind: item.r#type.clone().unwrap_or_default(),
+                })
+                .await
+                .ok();
+
+                Ok(())
+            });
+        }
+
+        // Sliding-window speed tracker (pure coordinator state — no sharing needed).
+        let mut speed_window: VecDeque<(Instant, u64)> = VecDeque::new();
+
+        while let Some(result) = join_set.join_next().await {
+            result.map_err(|e| LaunchError::Archive(e.to_string()))??;
+
+            let now = Instant::now();
+            let dl = downloaded.load(Ordering::Relaxed);
+            speed_window.push_back((now, dl));
+
+            // Evict samples older than 5 seconds.
+            while speed_window
+                .front()
+                .map_or(false, |(t, _)| now.duration_since(*t).as_secs_f64() > 5.0)
+            {
+                speed_window.pop_front();
+            }
+
+            if let Some((t0, b0)) = speed_window.front() {
+                let dt = now.duration_since(*t0).as_secs_f64();
+                if dt > 0.1 {
+                    let speed = dl.saturating_sub(*b0) as f64 / dt;
+                    event_tx.send(LaunchEvent::Speed(speed)).await.ok();
+                    if speed > 0.0 && total_bytes > 0 {
+                        let remaining = total_bytes.saturating_sub(dl) as f64 / speed;
+                        event_tx.send(LaunchEvent::Estimated(remaining)).await.ok();
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Returns `true` if a HEAD request to `url` succeeds with a 2xx status.
+    pub async fn check_url(&self, url: &str) -> bool {
+        self.client
+            .head(url)
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+    }
+
+    /// Iterate `mirrors` in order, appending `path`, and return the first URL
+    /// that responds successfully to a HEAD request.  Returns `None` if all
+    /// mirrors are unreachable.
+    pub async fn check_mirror(&self, mirrors: &[&str], path: &str) -> Option<String> {
+        let path = path.trim_start_matches('/');
+        for mirror in mirrors {
+            let url = format!("{}/{}", mirror.trim_end_matches('/'), path);
+            if self.check_url(&url).await {
+                return Some(url);
+            }
+        }
+        None
+    }
+}
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+/// Download `item` to disk, updating `dl_counter` with each received chunk.
+/// Returns `DownloadError` on network, I/O, or checksum failure.
+async fn fetch_one(
+    client: reqwest::Client,
+    item: &DownloadItem,
+    dl_counter: &Arc<AtomicU64>,
+) -> Result<(), DownloadError> {
+    let dir = if item.folder.as_os_str().is_empty() {
+        item.path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."))
+    } else {
+        item.folder.clone()
+    };
+    tokio::fs::create_dir_all(&dir).await?;
+
+    let response = client.get(&item.url).send().await?.error_for_status()?;
+
+    let mut file = tokio::fs::File::create(&item.path).await?;
+    let mut stream = response.bytes_stream();
+    let mut hasher = sha1::Sha1::new();
+    let verify = item.sha1.is_some();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        file.write_all(&chunk).await?;
+        if verify {
+            hasher.update(&chunk);
+        }
+        dl_counter.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+    }
+    file.flush().await?;
+
+    if let Some(expected) = &item.sha1 {
+        let actual: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        if actual != *expected {
+            return Err(DownloadError::ChecksumMismatch {
+                file: item.name.clone(),
+                expected: expected.clone(),
+                actual,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    fn make_downloader() -> Downloader {
+        Downloader::new(5, 4)
+    }
+
+    #[tokio::test]
+    async fn download_multiple_empty_list() {
+        let d = make_downloader();
+        let (tx, _rx) = mpsc::channel(16);
+        d.download_multiple(vec![], tx).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn download_file_bad_url_returns_error() {
+        let dir = TempDir::new().unwrap();
+        let item = DownloadItem {
+            url: "http://127.0.0.1:1/nonexistent".into(),
+            path: dir.path().join("out.bin"),
+            folder: dir.path().to_path_buf(),
+            name: "out.bin".into(),
+            size: 0,
+            r#type: None,
+            sha1: None,
+        };
+        let d = Downloader::new(1, 1); // 1-second timeout
+        let result = d.download_file(&item).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn check_url_unreachable_returns_false() {
+        let d = Downloader::new(1, 1);
+        assert!(!d.check_url("http://127.0.0.1:1/test").await);
+    }
+
+    #[tokio::test]
+    async fn check_mirror_all_bad_returns_none() {
+        let d = Downloader::new(1, 1);
+        let result = d
+            .check_mirror(&["http://127.0.0.1:1"], "/some/path.jar")
+            .await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn download_multiple_bad_url_propagates_error() {
+        let dir = TempDir::new().unwrap();
+        let item = DownloadItem {
+            url: "http://127.0.0.1:1/nonexistent".into(),
+            path: dir.path().join("out.bin"),
+            folder: dir.path().to_path_buf(),
+            name: "out.bin".into(),
+            size: 0,
+            r#type: Some("test".into()),
+            sha1: None,
+        };
+        let d = Downloader::new(1, 1);
+        let (tx, _rx) = mpsc::channel(16);
+        let result = d.download_multiple(vec![item], tx).await;
+        assert!(result.is_err());
+    }
+}

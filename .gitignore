@@ -1,0 +1,12 @@
+# Rust build artifacts
+/target/
+
+# Minecraft game files (downloaded at runtime)
+/minecraft/
+
+# Logs
+/logs/
+*.log
+
+# Claude Code local config
+.claude/
