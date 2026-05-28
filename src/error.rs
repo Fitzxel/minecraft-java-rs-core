@@ -8,6 +8,9 @@ pub enum LaunchError {
     #[error("no internet connection and no local cache available")]
     NoInternetNoCache,
 
+    #[error("game data not ready: call download_game first")]
+    GameDataNotReady,
+
     #[error("corrupt local cache: {0}")]
     CorruptCache(String),
 

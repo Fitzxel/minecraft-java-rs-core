@@ -410,9 +410,10 @@ async fn download_game_end_to_end() {
         }
     });
 
-    let launcher = Launcher::new(options);
-    let game_data = launcher.download_game(tx).await.unwrap();
+    let mut launcher = Launcher::new(options);
+    launcher.download_game(tx).await.unwrap();
 
+    let game_data = launcher.game_data().unwrap();
     assert_eq!(game_data.minecraft_version, "1.20.4");
     assert!(!game_data.minecraft_java.path.is_empty());
     assert!(dir.path().join("versions").join("1.20.4").exists());

@@ -33,37 +33,45 @@ use crate::utils::version_check::is_old;
 
 pub struct Launcher {
     options: LaunchOptions,
+    game_data: Option<GameData>,
 }
 
 impl Launcher {
     pub fn new(options: LaunchOptions) -> Self {
-        Self { options }
+        Self { options, game_data: None }
     }
 
     pub fn options(&self) -> &LaunchOptions {
         &self.options
     }
 
+    pub fn game_data(&self) -> Option<&GameData> {
+        self.game_data.as_ref()
+    }
+
     /// Download, verify, and optionally install a mod loader for the configured
-    /// Minecraft version.
+    /// Minecraft version. Stores the result in `self.game_data`.
     ///
-    /// Emits progress events on `event_tx`. Returns a `GameData` that can be
-    /// passed directly to [`Launcher::launch`].
+    /// Emits progress events on `event_tx`. After this call,
+    /// [`Launcher::launch`] can be invoked without downloading again.
     ///
     /// If there is no internet connection and a valid cache exists, the cache
-    /// is returned without network access. If there is no cache either, returns
+    /// is loaded without network access. If there is no cache either, returns
     /// [`LaunchError::NoInternetNoCache`].
     pub async fn download_game(
-        &self,
+        &mut self,
         event_tx: Sender<LaunchEvent>,
-    ) -> Result<GameData, LaunchError> {
+    ) -> Result<(), LaunchError> {
         let options = &self.options;
 
         // ── Offline fast-path ─────────────────────────────────────────────────
         if !check_internet().await {
-            return load_game_data(&options.save_dir())
-                .await
-                .map_err(|_| LaunchError::NoInternetNoCache);
+            self.game_data = Some(
+                load_game_data(&options.save_dir())
+                    .await
+                    .map_err(|_| LaunchError::NoInternetNoCache)?,
+            );
+            return Ok(());
         }
 
         // ── Shared HTTP client ────────────────────────────────────────────────
@@ -165,7 +173,7 @@ impl Launcher {
             copy_assets(options, &version_json).await?;
         }
 
-        // ── Persist & return ──────────────────────────────────────────────────
+        // ── Persist & store ───────────────────────────────────────────────────
         let game_data = GameData {
             minecraft_json: version_json,
             minecraft_loader: None,
@@ -183,20 +191,35 @@ impl Launcher {
         };
 
         save_game_data(&options.save_dir(), &game_data).await?;
+        self.game_data = Some(game_data);
 
-        Ok(game_data)
+        Ok(())
     }
 
     /// Assemble the Java command line and spawn the Minecraft process.
+    ///
+    /// Resolves game data from `self.game_data` (set by [`Launcher::download_game`])
+    /// or, if absent, from the persisted cache on disk. Returns
+    /// [`LaunchError::GameDataNotReady`] if neither is available.
     ///
     /// Stdout and stderr are piped; each line is forwarded as a
     /// [`LaunchEvent::Data`] event. The caller is responsible for calling
     /// `child.wait()` and emitting [`LaunchEvent::Close`] when appropriate.
     pub async fn launch(
         &self,
-        game_data: &GameData,
         event_tx: Sender<LaunchEvent>,
     ) -> Result<tokio::process::Child, LaunchError> {
+        let loaded;
+        let game_data: &GameData = match &self.game_data {
+            Some(gd) => gd,
+            None => {
+                loaded = load_game_data(&self.options.save_dir())
+                    .await
+                    .map_err(|_| LaunchError::GameDataNotReady)?;
+                &loaded
+            }
+        };
+
         let options = &self.options;
         let version_json = &game_data.minecraft_json;
 
@@ -377,11 +400,11 @@ impl Launcher {
     /// let _ = tx.send(LaunchEvent::Close(code)).await;
     /// ```
     pub async fn start(
-        &self,
+        &mut self,
         event_tx: Sender<LaunchEvent>,
     ) -> Result<tokio::process::Child, LaunchError> {
-        let game_data = self.download_game(event_tx.clone()).await?;
-        self.launch(&game_data, event_tx).await
+        self.download_game(event_tx.clone()).await?;
+        self.launch(event_tx).await
     }
 }
 

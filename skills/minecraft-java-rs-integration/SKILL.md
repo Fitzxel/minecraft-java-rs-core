@@ -1,5 +1,8 @@
 ---
 name: minecraft-java-rs-integration
+metadata:
+  author: Fitzxel
+  version: "0.1.0"
 description: >
   Guide and code generator for integrating the minecraft-java-rs-core Rust library
   into external projects. Use this skill whenever someone wants to use
@@ -46,10 +49,23 @@ minecraft-msa-auth = { git = "https://github.com/minecraft-rs/minecraft-msa-auth
 | `LaunchOptions` | struct | Full configuration for a launch session |
 | `Authenticator` | struct | Player identity (offline or Microsoft) |
 | `LoaderConfig` | struct | Mod loader selection and build |
-| `Launcher` | struct | Entry point — call `.start()` or `.download_game()` |
+| `Launcher` | struct | Entry point — owns `game_data` state after download |
 | `LaunchEvent` | enum | Progress, logs, and exit code delivered over a channel |
 
-The typical flow is: **build `LaunchOptions` → create `Launcher` → open a `mpsc` channel → call `.start(tx)`** and stream events from the receiver.
+`Launcher` always needs a `mut` binding. There are two usage patterns:
+
+**All-in-one:** `download_game` + `launch` in a single call.
+```
+build LaunchOptions → mut Launcher::new → mpsc channel → launcher.start(tx)
+```
+
+**Split:** download once, re-launch without re-downloading (e.g. restart after crash).
+```
+launcher.download_game(tx).await?   // stores GameData internally
+launcher.launch(tx).await?          // reads from self.game_data or disk cache
+```
+
+`launch` can also be called without a prior `download_game` in the same session — it will load the persisted cache from disk. If no cache exists it returns `LaunchError::GameDataNotReady`.
 
 ---
 
@@ -95,7 +111,8 @@ async fn main() {
         }
     });
 
-    let mut child = Launcher::new(options).start(tx).await.unwrap();
+    let mut launcher = Launcher::new(options);
+    let mut child = launcher.start(tx).await.unwrap();
     child.wait().await.ok();
 }
 ```
@@ -302,13 +319,55 @@ LaunchOptions {
 
 ---
 
-## 8. Download only (no launch)
+## 8. Launcher flow patterns
 
-Pre-cache all game files without spawning the process:
+### All-in-one (download + launch)
 
 ```rust
-launcher.download_game(tx).await?;
+let mut launcher = Launcher::new(options);
+let mut child = launcher.start(tx).await?;
+let code = child.wait().await?.code().unwrap_or(-1);
+let _ = close_tx.send(LaunchEvent::Close(code)).await;
 ```
+
+### Download only (pre-cache, no launch)
+
+```rust
+let mut launcher = Launcher::new(options);
+launcher.download_game(tx).await?;
+// All files are on disk; launcher.game_data() now returns Some(&GameData)
+```
+
+### Launch without re-downloading (split flow)
+
+Useful for restarting after a crash, or launching from a pre-downloaded installation:
+
+```rust
+// First run — download and launch
+let mut launcher = Launcher::new(options.clone());
+launcher.download_game(tx.clone()).await?;
+let mut child = launcher.launch(tx).await?;
+child.wait().await.ok();
+
+// Second run — reuse the same launcher (game_data already in memory)
+let mut child2 = launcher.launch(tx2).await?;
+child2.wait().await.ok();
+```
+
+Or across separate sessions (reads persisted cache from disk automatically):
+
+```rust
+// New session — no download_game call needed if files are already present
+let mut launcher = Launcher::new(options);
+// launcher.game_data() is None here, but launch() loads from disk cache
+let mut child = launcher.launch(tx).await?;  // errors with GameDataNotReady if no cache
+```
+
+### Error: GameDataNotReady
+
+`launch` returns `LaunchError::GameDataNotReady` when neither `self.game_data` is set
+nor a persisted cache file exists on disk. Always call `download_game` (or `start`)
+at least once before calling `launch` standalone.
 
 ---
 

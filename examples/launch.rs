@@ -286,7 +286,7 @@ async fn main() {
     }
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    let launcher = Launcher::new(options);
+    let mut launcher = Launcher::new(options);
 
     // ── Event channel ─────────────────────────────────────────────────────────
     let (tx, rx) = mpsc::channel::<LaunchEvent>(512);
