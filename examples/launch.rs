@@ -54,6 +54,7 @@ struct Args {
     loader_type: Option<LoaderType>,
     loader_build: String,
     only_download: bool,
+    verify: bool,
     auto_close: Option<u64>,
 }
 
@@ -96,6 +97,7 @@ impl Args {
             loader_type,
             loader_build: flag_val(&argv, "--loader-build").unwrap_or_else(|| "latest".into()),
             only_download: argv.iter().any(|a| a == "--only-download"),
+            verify: argv.iter().any(|a| a == "--verify"),
             auto_close: flag_val(&argv, "--auto-close")
                 .and_then(|s| s.parse::<u64>().ok()),
         }
@@ -122,6 +124,7 @@ OPTIONS:
                               latest | recommended | <exact-version>
                                                          [default: latest]
   --only-download           Download game files, don't launch
+  --verify                  Re-verify SHA-1 of all files after download
   --auto-close <SECS>       Kill Minecraft after N seconds
   -h, --help                Print this message
 
@@ -188,7 +191,7 @@ async fn print_events(mut rx: mpsc::Receiver<LaunchEvent>) {
                 println!("\n[#] All game files ready.");
             }
             LaunchEvent::Extract(name) => {
-                println!("\r[extract]: {name}                    ");
+                println!("\r[extract]: {name}");
             }
             LaunchEvent::Patch(msg) => {
                 print!("[patch]: {msg}");
@@ -253,7 +256,7 @@ async fn main() {
         java: JavaOptions::default(),
         loader,
         screen: ScreenConfig::default(),
-        verify: false,
+        verify: args.verify,
         game_args: vec![],
         jvm_args: vec![],
         instance: args.instance.clone(),
@@ -281,7 +284,6 @@ async fn main() {
 
     // ── Event channel ─────────────────────────────────────────────────────────
     let (tx, rx) = mpsc::channel::<LaunchEvent>(512);
-    let close_tx = tx.clone(); // keep a clone to send Close after child exits
     let printer = tokio::spawn(print_events(rx));
 
     // ── Download only ─────────────────────────────────────────────────────────
@@ -295,6 +297,8 @@ async fn main() {
         println!("[#] Done. Exiting.");
         return;
     }
+
+    let close_tx = tx.clone(); // keep a clone to send Close after child exits
 
     // ── Start ─────────────────────────────────────────────────────────────────
     println!("[#] Starting download + launch...");
