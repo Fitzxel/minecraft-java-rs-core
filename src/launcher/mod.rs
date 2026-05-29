@@ -103,8 +103,6 @@ impl Launcher {
                 .await?;
         }
 
-        let _ = event_tx.send(LaunchEvent::GameDownloadFinished).await;
-
         // ── Mod loader install ────────────────────────────────────────────────
         let (loader_libraries, loader_main_class, loader_version_id, loader_type, loader_extra_game_args, loader_extra_jvm_args) = if options.loader.enable {
             if let Some(loader_type) = &options.loader.loader_type {
@@ -192,6 +190,8 @@ impl Launcher {
 
         save_game_data(&options.save_dir(), &game_data).await?;
         self.game_data = Some(game_data);
+
+        let _ = event_tx.send(LaunchEvent::GameDownloadFinished).await;
 
         Ok(())
     }
@@ -348,6 +348,7 @@ impl Launcher {
         // Spawn the process.
         let mut cmd = tokio::process::Command::new(java_path);
         cmd.args(&all_args)
+            .current_dir(options.save_dir())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
