@@ -13,6 +13,9 @@ use tokio::task::JoinSet;
 use crate::error::{DownloadError, LaunchError};
 use crate::launcher::events::LaunchEvent;
 
+const DOWNLOAD_MAX_RETRIES: u32 = 3;
+const DOWNLOAD_INITIAL_BACKOFF_MS: u64 = 500;
+
 // ── DownloadItem ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -40,7 +43,7 @@ pub struct DownloadItem {
 
 pub struct Downloader {
     client: reqwest::Client,
-    /// Maximum number of simultaneous downloads (clamped ≥ 1).
+    /// Effective concurrency after applying the adaptive cap.
     concurrency: usize,
 }
 
@@ -52,7 +55,7 @@ impl Downloader {
             .expect("failed to build reqwest client");
         Self {
             client,
-            concurrency: (concurrency as usize).max(1),
+            concurrency: adaptive_concurrency(concurrency),
         }
     }
 
@@ -181,8 +184,38 @@ impl Downloader {
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
+/// Clamp user-requested concurrency to a system-aware upper bound.
+///
+/// Each active download holds roughly one TCP connection, a ~64 KB read buffer,
+/// and a Tokio task. High values (e.g. 400) exhaust file descriptors and network
+/// stack memory without any throughput gain. The cap is:
+///
+///   min(requested, cpu_cores × 8, 64).max(1)
+///
+/// This allows a 4-core machine to run up to 32 simultaneous downloads and an
+/// 8-core machine up to 64, while still honouring smaller values the caller sets.
+fn adaptive_concurrency(requested: u32) -> usize {
+    let cpu_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let cap = (cpu_count * 8).min(64).max(4);
+    (requested as usize).clamp(1, cap)
+}
+
+/// Returns true for HTTP status codes worth retrying.
+/// 4xx client errors are not retried since they won't change.
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
 /// Download `item` to disk, updating `dl_counter` with each received chunk.
-/// Returns `DownloadError` on network, I/O, or checksum failure.
+///
+/// Uses a temporary file (`<path>.tmp`) and an atomic rename so a failed or
+/// interrupted download never leaves a corrupt file at the final path.
+///
+/// Retries up to `DOWNLOAD_MAX_RETRIES` times on network errors, 5xx, and 429,
+/// with exponential backoff starting at `DOWNLOAD_INITIAL_BACKOFF_MS`.
+/// Checksum mismatches and I/O errors are not retried.
 async fn fetch_one(
     client: reqwest::Client,
     item: &DownloadItem,
@@ -198,39 +231,111 @@ async fn fetch_one(
     };
     tokio::fs::create_dir_all(&dir).await?;
 
-    let response = client.get(&item.url).send().await?.error_for_status()?;
+    // Temporary path: `foo.jar` → `foo.jar.tmp`
+    let tmp_path = {
+        let mut s = item.path.as_os_str().to_owned();
+        s.push(".tmp");
+        PathBuf::from(s)
+    };
 
-    let mut file = tokio::fs::File::create(&item.path).await?;
-    let mut stream = response.bytes_stream();
-    let mut hasher = sha1::Sha1::new();
-    let verify = item.sha1.is_some();
+    let mut last_err: Option<DownloadError> = None;
+    let mut backoff = DOWNLOAD_INITIAL_BACKOFF_MS;
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        file.write_all(&chunk).await?;
-        if verify {
-            hasher.update(&chunk);
+    for attempt in 0..=DOWNLOAD_MAX_RETRIES {
+        if attempt > 0 {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            tokio::time::sleep(Duration::from_millis(backoff)).await;
+            backoff = (backoff * 2).min(8_000);
         }
-        dl_counter.fetch_add(chunk.len() as u64, Ordering::Relaxed);
-    }
-    file.flush().await?;
 
-    if let Some(expected) = &item.sha1 {
-        let actual: String = hasher
-            .finalize()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        if actual != *expected {
-            return Err(DownloadError::ChecksumMismatch {
-                file: item.name.clone(),
-                expected: expected.clone(),
-                actual,
-            });
+        // ── Send request ──────────────────────────────────────────────────────
+        let response = match client.get(&item.url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(DownloadError::Http(e));
+                continue;
+            }
+        };
+
+        let status = response.status();
+        if is_retryable_status(status) {
+            last_err = Some(DownloadError::Http(
+                response.error_for_status().unwrap_err(),
+            ));
+            continue;
         }
+        if !status.is_success() {
+            // 4xx — don't retry
+            return Err(DownloadError::Http(
+                response.error_for_status().unwrap_err(),
+            ));
+        }
+
+        // ── Stream body to temp file ──────────────────────────────────────────
+        let mut file = match tokio::fs::File::create(&tmp_path).await {
+            Ok(f) => f,
+            Err(e) => return Err(DownloadError::Io(e)),
+        };
+
+        let mut stream = response.bytes_stream();
+        let mut hasher = sha1::Sha1::new();
+        let verify = item.sha1.is_some();
+        let mut stream_err: Option<DownloadError> = None;
+
+        while let Some(chunk_result) = stream.next().await {
+            match chunk_result {
+                Ok(chunk) => {
+                    if let Err(e) = file.write_all(&chunk).await {
+                        return Err(DownloadError::Io(e));
+                    }
+                    if verify {
+                        hasher.update(&chunk);
+                    }
+                    dl_counter.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    stream_err = Some(DownloadError::Http(e));
+                    break;
+                }
+            }
+        }
+
+        if let Some(e) = stream_err {
+            last_err = Some(e);
+            continue;
+        }
+
+        if let Err(e) = file.flush().await {
+            return Err(DownloadError::Io(e));
+        }
+
+        // ── Checksum ──────────────────────────────────────────────────────────
+        if let Some(expected) = &item.sha1 {
+            let actual: String = hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            if actual != *expected {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                return Err(DownloadError::ChecksumMismatch {
+                    file: item.name.clone(),
+                    expected: expected.clone(),
+                    actual,
+                });
+            }
+        }
+
+        // ── Atomic rename ─────────────────────────────────────────────────────
+        if let Err(e) = tokio::fs::rename(&tmp_path, &item.path).await {
+            return Err(DownloadError::Io(e));
+        }
+
+        return Ok(());
     }
 
-    Ok(())
+    let _ = tokio::fs::remove_file(&tmp_path).await;
+    Err(last_err.unwrap_or(DownloadError::Timeout))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -243,6 +348,23 @@ mod tests {
 
     fn make_downloader() -> Downloader {
         Downloader::new(5, 4)
+    }
+
+    #[test]
+    fn adaptive_concurrency_clamps_high_value() {
+        // Whatever the CPU count is, 400 must be reduced.
+        assert!(adaptive_concurrency(400) <= 64);
+    }
+
+    #[test]
+    fn adaptive_concurrency_preserves_low_value() {
+        assert_eq!(adaptive_concurrency(2), 2);
+        assert_eq!(adaptive_concurrency(1), 1);
+    }
+
+    #[test]
+    fn adaptive_concurrency_floors_at_one() {
+        assert_eq!(adaptive_concurrency(0), 1);
     }
 
     #[tokio::test]
@@ -300,5 +422,29 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let result = d.download_multiple(vec![item], tx).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn no_tmp_file_left_after_failed_download() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("out.bin");
+        let item = DownloadItem {
+            url: "http://127.0.0.1:1/nonexistent".into(),
+            path: path.clone(),
+            folder: dir.path().to_path_buf(),
+            name: "out.bin".into(),
+            size: 0,
+            r#type: None,
+            sha1: None,
+        };
+        let d = Downloader::new(1, 1);
+        let _ = d.download_file(&item).await;
+
+        let tmp = {
+            let mut s = path.as_os_str().to_owned();
+            s.push(".tmp");
+            PathBuf::from(s)
+        };
+        assert!(!tmp.exists(), ".tmp file should be cleaned up after failure");
     }
 }
