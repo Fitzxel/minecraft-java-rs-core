@@ -43,7 +43,6 @@ async fn main() {
         uuid: "00000000-0000-0000-0000-000000000001".into(),
         xbox_account: None,
         user_properties: None,
-        meta: None,
         client_id: None,
         client_token: None,
     };

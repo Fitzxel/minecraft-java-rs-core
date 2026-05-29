@@ -86,7 +86,6 @@ async fn main() {
         uuid: "00000000-0000-0000-0000-000000000001".into(),
         xbox_account: None,
         user_properties: None,
-        meta: None,
         client_id: None,
         client_token: None,
     };
@@ -164,7 +163,6 @@ async fn microsoft_auth() -> Authenticator {
         uuid: mc_profile.uuid.to_string(),
         xbox_account: None,
         user_properties: None,
-        meta: None,
         client_id: Some("YOUR_AZURE_CLIENT_ID".into()),
         client_token: None,
     }
