@@ -11,6 +11,7 @@ use crate::loader::forge::try_patcher_install;
 use crate::models::loader::{ForgeVersionSection, InstallerInfo, LoaderLibrary, LoaderType};
 use crate::models::minecraft::AssetItem;
 use crate::net::downloader::{DownloadItem, Downloader};
+use crate::net::http::fetch_text;
 use crate::utils::archive::{get_file_from_archive, ArchiveQueryResult};
 use crate::utils::paths::get_path_libraries;
 
@@ -139,13 +140,9 @@ impl NeoForgeMC {
         };
 
         let (versions, old_api) = if legacy_versions.is_empty() {
-            let text = client
-                .get(NEW_META_URL)
-                .send()
-                .await?
-                .error_for_status()?
-                .text()
-                .await?;
+            let text = fetch_text(client, NEW_META_URL)
+                .await
+                .map_err(LoaderError::ApiError)?;
             let short_prefix = make_short_prefix(mc_version);
             let filtered: Vec<String> = parse_maven_xml_versions(&text)
                 .into_iter()

@@ -6,6 +6,7 @@ use crate::launcher::options::LaunchOptions;
 use crate::models::loader::{FabricJson, QuiltMeta};
 use crate::models::minecraft::AssetItem;
 use crate::net::downloader::{DownloadItem, Downloader};
+use crate::net::http::fetch_json;
 use crate::utils::paths::get_path_libraries;
 
 use super::fabric::resolve_lib_url;
@@ -35,13 +36,9 @@ impl QuiltMC {
         build: &str,
         client: &reqwest::Client,
     ) -> Result<FabricJson, LoaderError> {
-        let meta: QuiltMeta = client
-            .get(QUILT_META)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let meta: QuiltMeta = fetch_json(client, QUILT_META)
+            .await
+            .map_err(LoaderError::ApiError)?;
 
         if !meta.game.iter().any(|g| g.version == mc_version) {
             return Err(LoaderError::VersionNotFound(format!(
@@ -81,14 +78,9 @@ impl QuiltMC {
             .replace("${version}", mc_version)
             .replace("${build}", &build_ver);
 
-        let json: FabricJson = client
-            .get(&profile_url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
+        let json: FabricJson = fetch_json(client, &profile_url)
             .await
-            .map_err(|e| LoaderError::ApiError(e.to_string()))?;
+            .map_err(LoaderError::ApiError)?;
 
         Ok(json)
     }

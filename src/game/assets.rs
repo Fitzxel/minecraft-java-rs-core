@@ -1,6 +1,7 @@
 use crate::error::LaunchError;
 use crate::launcher::options::LaunchOptions;
 use crate::models::minecraft::{AssetIndexData, AssetItem, MinecraftVersionJson};
+use crate::net::http::fetch_text;
 
 const RESOURCES_BASE: &str = "https://resources.download.minecraft.net";
 
@@ -25,15 +26,11 @@ pub async fn get_assets(
         None => return Ok(vec![]),
     };
 
-    let raw = client
-        .get(&ai.url)
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
-
-    let data: AssetIndexData = serde_json::from_str(&raw)?;
+    let raw = fetch_text(client, &ai.url)
+        .await
+        .map_err(LaunchError::InvalidData)?;
+    let data: AssetIndexData = serde_json::from_str(&raw)
+        .map_err(|e| LaunchError::InvalidData(format!("GET {}: failed to parse asset index: {e}", &ai.url)))?;
 
     let base = &options.path;
     let mut items: Vec<AssetItem> = Vec::with_capacity(data.objects.len() + 1);

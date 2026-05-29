@@ -6,6 +6,7 @@ use crate::launcher::options::LaunchOptions;
 use crate::models::loader::{FabricJson, FabricMeta, LoaderType};
 use crate::models::minecraft::AssetItem;
 use crate::net::downloader::{DownloadItem, Downloader};
+use crate::net::http::fetch_json;
 use crate::utils::paths::get_path_libraries;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -59,13 +60,9 @@ impl FabricMC {
             FabricVariant::Legacy => (LEGACY_META, LEGACY_PROFILE),
         };
 
-        let meta: FabricMeta = client
-            .get(meta_url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let meta: FabricMeta = fetch_json(client, meta_url)
+            .await
+            .map_err(LoaderError::ApiError)?;
 
         // Validate the MC version is supported.
         let version_name = match self.variant {
@@ -102,14 +99,9 @@ impl FabricMC {
             .replace("${version}", mc_version)
             .replace("${build}", &build_ver);
 
-        let json: FabricJson = client
-            .get(&profile_url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
+        let json: FabricJson = fetch_json(client, &profile_url)
             .await
-            .map_err(|e| LoaderError::ApiError(e.to_string()))?;
+            .map_err(LoaderError::ApiError)?;
 
         Ok(json)
     }

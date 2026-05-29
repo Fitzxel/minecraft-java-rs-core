@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::error::LaunchError;
+use crate::net::http::fetch_json;
 use crate::launcher::options::LaunchOptions;
 use crate::models::minecraft::{ArtifactInfo, AssetItem, Library, MinecraftVersionJson};
 use crate::utils::paths::get_path_libraries;
@@ -113,13 +114,9 @@ pub async fn get_assets_others(
         _ => return Ok(vec![]),
     };
 
-    let raw: Vec<CustomAssetItem> = client
-        .get(url)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let raw: Vec<CustomAssetItem> = fetch_json(client, url)
+        .await
+        .map_err(LaunchError::InvalidData)?;
 
     let mut items = Vec::with_capacity(raw.len());
 

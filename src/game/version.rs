@@ -1,6 +1,7 @@
 use crate::error::LaunchError;
 use crate::launcher::options::LaunchOptions;
 use crate::models::minecraft::{MinecraftVersionJson, MojangVersionManifest};
+use crate::net::http::fetch_json;
 
 const MANIFEST_URL: &str =
     "https://launchermeta.mojang.com/mc/game/version_manifest_v2.json";
@@ -34,13 +35,9 @@ pub(crate) async fn fetch_version_json(
         .unwrap_or(0);
     let manifest_url = format!("{manifest_base}?_t={ts}");
 
-    let manifest: MojangVersionManifest = client
-        .get(&manifest_url)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let manifest: MojangVersionManifest = fetch_json(client, &manifest_url)
+        .await
+        .map_err(LaunchError::InvalidData)?;
 
     let version = resolve_alias(&options.version, &manifest);
 
@@ -50,13 +47,9 @@ pub(crate) async fn fetch_version_json(
         .find(|v| v.id == version)
         .ok_or_else(|| LaunchError::VersionNotFound(version.clone()))?;
 
-    let mut version_json: MinecraftVersionJson = client
-        .get(&entry.url)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let mut version_json: MinecraftVersionJson = fetch_json(client, &entry.url)
+        .await
+        .map_err(LaunchError::InvalidData)?;
 
     if is_linux_arm() {
         crate::game::lwjgl_native::process_json(&mut version_json)?;

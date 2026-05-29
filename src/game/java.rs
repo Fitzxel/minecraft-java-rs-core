@@ -11,6 +11,7 @@ use crate::models::java::{
 };
 use crate::models::minecraft::MinecraftVersionJson;
 use crate::net::downloader::{DownloadItem, Downloader};
+use crate::net::http::{fetch_json, fetch_text};
 use crate::utils::archive::extract_tar_gz;
 
 const ALL_JSON_URL: &str =
@@ -156,11 +157,8 @@ async fn try_mojang(
     client: &reqwest::Client,
     event_tx: &Sender<LaunchEvent>,
 ) -> Result<Option<JavaDownloadResult>, LaunchError> {
-    let all_text = match client.get(ALL_JSON_URL).send().await {
-        Ok(r) => match r.error_for_status() {
-            Ok(r) => r.text().await?,
-            Err(_) => return Ok(None),
-        },
+    let all_text = match fetch_text(client, ALL_JSON_URL).await {
+        Ok(t) => t,
         Err(_) => return Ok(None),
     };
 
@@ -179,13 +177,9 @@ async fn try_mojang(
         None => return Ok(None),
     };
 
-    let manifest_text = client
-        .get(&manifest_url)
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
+    let manifest_text = fetch_text(client, &manifest_url)
+        .await
+        .map_err(LaunchError::InvalidData)?;
 
     let manifest: JavaManifestData = serde_json::from_str(&manifest_text)?;
 
@@ -267,13 +261,9 @@ async fn get_from_adoptium(
         "{ADOPTIUM_API_BASE}/{major_version}/hotspot?os={os}&architecture={arch}&image_type={image_type}&jvm_impl=hotspot&vendor=eclipse"
     );
 
-    let releases: Vec<AdoptiumRelease> = client
-        .get(&url)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let releases: Vec<AdoptiumRelease> = fetch_json(client, &url)
+        .await
+        .map_err(LaunchError::InvalidData)?;
 
     let release = releases.into_iter().next().ok_or_else(|| {
         LaunchError::Io(std::io::Error::new(
