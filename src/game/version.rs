@@ -183,6 +183,7 @@ mod tests {
             },
             timeout_secs: 5,
             download_concurrency: 1,
+            verify_concurrency: 4,
             memory: MemoryConfig::default(),
             java: JavaOptions::default(),
             loader: LoaderConfig::default(),

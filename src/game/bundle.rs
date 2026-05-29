@@ -1,6 +1,10 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use tokio::sync::mpsc::Sender;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use crate::error::LaunchError;
 use crate::launcher::events::LaunchEvent;
@@ -110,10 +114,13 @@ pub async fn check_bundle(
 /// Verify the SHA-1 of every `Asset` / `NativeAsset` that is present on disk.
 ///
 /// Emits `LaunchEvent::Check` events and returns the paths of any files whose
-/// digest does not match the expected value.
+/// digest does not match the expected value. Up to `concurrency` files are
+/// hashed in parallel; use a lower value than `download_concurrency` to avoid
+/// seek thrashing on HDDs.
 pub async fn check_files(
     bundle: &[AssetItem],
     event_tx: &Sender<LaunchEvent>,
+    concurrency: u32,
 ) -> Result<Vec<String>, LaunchError> {
     let items: Vec<(PathBuf, String)> = bundle
         .iter()
@@ -131,24 +138,54 @@ pub async fn check_files(
         .collect();
 
     let total = items.len();
-    let mut bad: Vec<String> = Vec::new();
+    let semaphore = Arc::new(Semaphore::new(concurrency as usize));
+    let counter = Arc::new(AtomicUsize::new(0));
+    let mut tasks: JoinSet<Result<Option<String>, LaunchError>> = JoinSet::new();
 
-    for (idx, (path, expected_sha1)) in items.into_iter().enumerate() {
-        let _ = event_tx
-            .send(LaunchEvent::Check {
-                current: idx + 1,
-                total,
-                kind: "verify".into(),
+    for (path, expected_sha1) in items {
+        let sem = Arc::clone(&semaphore);
+        let tx = event_tx.clone();
+        let counter = Arc::clone(&counter);
+
+        tasks.spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+
+            let current = counter.fetch_add(1, Ordering::Relaxed) + 1;
+            let _ = tx
+                .send(LaunchEvent::Check {
+                    current,
+                    total,
+                    kind: "verify".into(),
+                })
+                .await;
+
+            let path_clone = path.clone();
+            let actual = tokio::task::spawn_blocking(move || {
+                get_file_hash(&path_clone, HashAlgorithm::Sha1)
             })
-            .await;
-
-        let path_clone = path.clone();
-        let actual = tokio::task::spawn_blocking(move || get_file_hash(&path_clone, HashAlgorithm::Sha1))
             .await
             .map_err(|e| LaunchError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))??;
 
-        if actual != expected_sha1 {
-            bad.push(path.to_string_lossy().into_owned());
+            if actual != expected_sha1 {
+                Ok(Some(path.to_string_lossy().into_owned()))
+            } else {
+                Ok(None)
+            }
+        });
+    }
+
+    let mut bad: Vec<String> = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok(Some(path))) => bad.push(path),
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(e) => {
+                return Err(LaunchError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                )))
+            }
         }
     }
 
@@ -282,7 +319,7 @@ mod tests {
 
         let bundle = vec![asset(&path.to_string_lossy(), &sha1, 11, "http://x")];
         let (tx, _rx) = mpsc::channel(16);
-        let bad = check_files(&bundle, &tx).await.unwrap();
+        let bad = check_files(&bundle, &tx, 4).await.unwrap();
         assert!(bad.is_empty());
     }
 
@@ -294,7 +331,7 @@ mod tests {
 
         let bundle = vec![asset(&path.to_string_lossy(), "0000000000000000000000000000000000000000", 9, "http://x")];
         let (tx, _rx) = mpsc::channel(16);
-        let bad = check_files(&bundle, &tx).await.unwrap();
+        let bad = check_files(&bundle, &tx, 4).await.unwrap();
         assert_eq!(bad.len(), 1);
     }
 
@@ -305,7 +342,7 @@ mod tests {
         let bundle = vec![asset(&path.to_string_lossy(), "abc", 0, "http://x")];
 
         let (tx, _rx) = mpsc::channel(16);
-        let bad = check_files(&bundle, &tx).await.unwrap();
+        let bad = check_files(&bundle, &tx, 4).await.unwrap();
         assert!(bad.is_empty());
     }
 }

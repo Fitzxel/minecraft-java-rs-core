@@ -37,7 +37,15 @@ pub struct Launcher {
 }
 
 impl Launcher {
-    pub fn new(options: LaunchOptions) -> Self {
+    pub fn new(mut options: LaunchOptions) -> Self {
+        // Absolutize options.path so every path derived from it (classpath,
+        // natives, game args, java binary) works even when the Java process
+        // runs with a different current_dir (e.g. save_dir for Tauri).
+        if options.path.is_relative() {
+            if let Ok(abs) = std::env::current_dir().map(|cwd| cwd.join(&options.path)) {
+                options.path = abs;
+            }
+        }
         Self { options, game_data: None }
     }
 
@@ -157,7 +165,7 @@ impl Launcher {
 
         // ── Optional post-download SHA-1 verify ───────────────────────────────
         if options.verify {
-            check_files(&bundle, &event_tx).await?;
+            check_files(&bundle, &event_tx, options.clamped_verify_concurrency()).await?;
         }
 
         // ── Extract native JARs ───────────────────────────────────────────────
@@ -333,7 +341,13 @@ impl Launcher {
         all_args.push(main_class);
         all_args.extend(game_args);
 
-        let java_path = &game_data.minecraft_java.path;
+        let java_path_raw = &game_data.minecraft_java.path;
+        // Resolve to an absolute path so the binary is found regardless of
+        // what current_dir is set to below.
+        let java_path_buf = std::path::Path::new(java_path_raw)
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from(java_path_raw));
+        let java_path = java_path_buf.to_string_lossy();
 
         // Sanitize auth token before logging the command.
         let access_token = &options.authenticator.access_token;
@@ -346,7 +360,7 @@ impl Launcher {
         let _ = event_tx.send(LaunchEvent::Data(sanitized)).await;
 
         // Spawn the process.
-        let mut cmd = tokio::process::Command::new(java_path);
+        let mut cmd = tokio::process::Command::new(java_path.as_ref());
         cmd.args(&all_args)
             .current_dir(options.save_dir())
             .stdout(Stdio::piped())
@@ -433,6 +447,7 @@ mod tests {
             },
             timeout_secs: 10,
             download_concurrency: 5,
+            verify_concurrency: 4,
             memory: MemoryConfig::default(),
             java: JavaOptions::default(),
             loader: LoaderConfig::default(),

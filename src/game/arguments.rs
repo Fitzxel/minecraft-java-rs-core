@@ -510,6 +510,7 @@ mod tests {
             },
             timeout_secs: 10,
             download_concurrency: 5,
+            verify_concurrency: 4,
             memory: MemoryConfig { min: "512M".into(), max: "4G".into() },
             java: JavaOptions::default(),
             loader: LoaderConfig::default(),

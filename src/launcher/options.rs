@@ -30,6 +30,11 @@ pub struct LaunchOptions {
     #[serde(default = "defaults::download_concurrency")]
     pub download_concurrency: u32,
 
+    /// Concurrent SHA-1 verify workers, clamped to 1–16 (default: 4).
+    /// Lower than `download_concurrency` to avoid disk seek thrashing on HDDs.
+    #[serde(default = "defaults::verify_concurrency")]
+    pub verify_concurrency: u32,
+
     #[serde(default)]
     pub memory: MemoryConfig,
 
@@ -100,6 +105,11 @@ impl LaunchOptions {
     /// `download_concurrency` clamped to the valid range 1–30.
     pub fn clamped_concurrency(&self) -> u32 {
         self.download_concurrency.clamp(1, 30)
+    }
+
+    /// `verify_concurrency` clamped to the valid range 1–16.
+    pub fn clamped_verify_concurrency(&self) -> u32 {
+        self.verify_concurrency.clamp(1, 16)
     }
 }
 
@@ -202,6 +212,7 @@ pub struct LoaderInnerConfig {
 mod defaults {
     pub fn timeout_secs() -> u64 { 10 }
     pub fn download_concurrency() -> u32 { 5 }
+    pub fn verify_concurrency() -> u32 { 4 }
     pub fn memory_min() -> String { "1G".into() }
     pub fn memory_max() -> String { "2G".into() }
     pub fn java_image_type() -> String { "jre".into() }
@@ -238,6 +249,17 @@ mod tests {
     }
 
     #[test]
+    fn verify_concurrency_clamp() {
+        let mut opts = make_opts(None);
+        opts.verify_concurrency = 0;
+        assert_eq!(opts.clamped_verify_concurrency(), 1);
+        opts.verify_concurrency = 99;
+        assert_eq!(opts.clamped_verify_concurrency(), 16);
+        opts.verify_concurrency = 4;
+        assert_eq!(opts.clamped_verify_concurrency(), 4);
+    }
+
+    #[test]
     fn memory_defaults() {
         let m = MemoryConfig::default();
         assert_eq!(m.min, "1G");
@@ -260,6 +282,7 @@ mod tests {
             },
             timeout_secs: 10,
             download_concurrency: 5,
+            verify_concurrency: 4,
             memory: MemoryConfig::default(),
             java: JavaOptions::default(),
             loader: LoaderConfig::default(),

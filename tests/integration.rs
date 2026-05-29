@@ -146,7 +146,7 @@ async fn check_bundle_writes_cfile_and_queues_missing_assets() {
     std::fs::write(&missing_asset, b"wrong content").unwrap();
 
     let (tx2, mut rx2) = mpsc::channel(64);
-    let corrupted = check_files(&bundle, &tx2).await.unwrap();
+    let corrupted = check_files(&bundle, &tx2, 4).await.unwrap();
     drain_channel(&mut rx2);
 
     // existing.jar is correct; missing.bin has wrong SHA-1.
@@ -268,6 +268,7 @@ fn launcher_constructs_and_save_dir_is_correct() {
         },
         timeout_secs: 10,
         download_concurrency: 5,
+        verify_concurrency: 4,
         memory: MemoryConfig::default(),
         java: JavaOptions::default(),
         loader: LoaderConfig::default(),
@@ -312,6 +313,7 @@ async fn get_version_json_real_network_resolves_latest_release() {
         },
         timeout_secs: 15,
         download_concurrency: 2,
+        verify_concurrency: 4,
         memory: MemoryConfig::default(),
         java: JavaOptions::default(),
         loader: LoaderConfig::default(),
@@ -375,6 +377,7 @@ async fn download_game_end_to_end() {
         },
         timeout_secs: 30,
         download_concurrency: 10,
+        verify_concurrency: 4,
         memory: MemoryConfig::default(),
         java: JavaOptions::default(),
         loader: LoaderConfig::default(),

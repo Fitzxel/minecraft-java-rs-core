@@ -222,7 +222,6 @@ async fn main() {
         uuid: uuid.clone(),
         xbox_account: None,
         user_properties: None,
-        meta: None,
         client_id: None,
         client_token: None,
     };
@@ -246,6 +245,7 @@ async fn main() {
         authenticator: auth,
         timeout_secs: 30,
         download_concurrency: 10,
+        verify_concurrency: 4,
         memory: MemoryConfig {
             min: args.min_mem.clone(),
             max: args.max_mem.clone(),
