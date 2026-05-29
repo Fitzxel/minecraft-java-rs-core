@@ -250,9 +250,6 @@ while let Some(event) = rx.recv().await {
             // Forge processor step
             println!("[patch] {msg}");
         }
-        LaunchEvent::JavaProgress { downloaded, total } => {
-            println!("[java] {downloaded}/{total}");
-        }
         LaunchEvent::GameDownloadFinished => {
             println!("All files ready.");
         }

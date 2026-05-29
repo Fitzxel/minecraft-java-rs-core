@@ -34,9 +34,6 @@ pub enum LaunchEvent {
     /// A Forge processor is running. Carries the processor class name.
     Patch(String),
 
-    /// Java runtime download progress (separate from game files).
-    JavaProgress { downloaded: u64, total: u64 },
-
     /// All game files have been downloaded and verified.
     GameDownloadFinished,
 

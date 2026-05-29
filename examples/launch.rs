@@ -194,15 +194,6 @@ async fn print_events(mut rx: mpsc::Receiver<LaunchEvent>) {
                 print!("[patch]: {msg}");
                 let _ = std::io::stdout().flush();
             }
-            LaunchEvent::JavaProgress { downloaded, total } => {
-                let pct = if total > 0 {
-                    (downloaded as f64 / total as f64 * 100.0) as u32
-                } else {
-                    0
-                };
-                print!("\r[java]: {downloaded}/{total} ({pct}%)   ");
-                let _ = std::io::stdout().flush();
-            }
             LaunchEvent::Data(line) => {
                 println!("[MC]: {line}");
             }

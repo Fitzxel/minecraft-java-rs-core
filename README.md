@@ -159,7 +159,6 @@ All progress and game output is delivered as `LaunchEvent` variants over a `toki
 | `Check { current, total, kind }` | File integrity check progress |
 | `Extract(String)` | A file is being extracted from an archive |
 | `Patch(String)` | A Forge processor step is running |
-| `JavaProgress { downloaded, total }` | Java runtime download progress |
 | `GameDownloadFinished` | All files downloaded and verified |
 | `Data(String)` | A line of stdout/stderr from the Minecraft process |
 | `Close(i32)` | Minecraft exited; carries the exit code |
@@ -234,6 +233,14 @@ cargo run --example launch -- --version 1.21.1 --username Steve --min-mem 2G --m
 | `--loader-build <BUILD>` | `latest` | `latest` \| `recommended` \| exact version |
 | `--only-download` | — | Download files without launching |
 | `--auto-close <SECS>` | — | Kill Minecraft after N seconds |
+
+## A note on AI-assisted development
+
+My programming background is mainly web development. While I've been picking up Rust along the way, this project was born out of necessity rather than passion for the language or a desire to practice it. I needed a solid Minecraft Java launcher core in Rust and there are very few options that actually cover what this project aims to do.
+
+Because of that, the code is — in principle — 100% AI-generated. If this ends up public it isn't a "look what I can build" statement. It's closer to "I built this, it's useful to me, and maybe it'll be useful to someone else too."
+
+Bug reports, improvements, and pull requests are genuinely welcome.
 
 ## License
 
