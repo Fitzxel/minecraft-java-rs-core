@@ -30,81 +30,109 @@ pub fn get_total_size(bundle: &[AssetItem]) -> u64 {
 /// does not match the expected value.
 ///
 /// Emits `LaunchEvent::Check` progress events as each file is evaluated.
+/// Up to `concurrency` files are checked in parallel.
 pub async fn check_bundle(
     bundle: &[AssetItem],
     event_tx: &Sender<LaunchEvent>,
+    concurrency: u32,
 ) -> Result<Vec<DownloadItem>, LaunchError> {
     let total = bundle.len();
-    let mut pending: Vec<DownloadItem> = Vec::new();
+    let semaphore = Arc::new(Semaphore::new(concurrency as usize));
+    let counter = Arc::new(AtomicUsize::new(0));
+    let mut tasks: JoinSet<Result<Option<DownloadItem>, LaunchError>> = JoinSet::new();
 
-    for (idx, item) in bundle.iter().enumerate() {
-        let _ = event_tx
-            .send(LaunchEvent::Check {
-                current: idx + 1,
-                total,
-                kind: "bundle".into(),
-            })
-            .await;
+    for item in bundle.iter().cloned() {
+        let sem = Arc::clone(&semaphore);
+        let tx = event_tx.clone();
+        let counter = Arc::clone(&counter);
 
-        match item {
-            AssetItem::CFile { path, content } => {
-                let dest = PathBuf::from(path);
-                if let Some(parent) = dest.parent() {
-                    tokio::fs::create_dir_all(parent).await?;
-                }
-                if !dest.exists() {
-                    tokio::fs::write(&dest, content).await?;
-                }
-            }
+        tasks.spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
 
-            AssetItem::Asset { path, sha1, size, url }
-            | AssetItem::NativeAsset { path, sha1, size, url } => {
-                let dest = PathBuf::from(path);
-                let needs_download = if dest.exists() {
-                    if sha1.is_empty() {
-                        false
-                    } else {
-                        // Run the blocking hash in a worker thread to avoid stalling the runtime.
-                        let dest_clone = dest.clone();
-                        let expected = sha1.clone();
-                        tokio::task::spawn_blocking(move || -> bool {
-                            match get_file_hash(&dest_clone, HashAlgorithm::Sha1) {
-                                Ok(actual) => actual != expected,
-                                Err(_) => true,
-                            }
-                        })
-                        .await
-                        .unwrap_or(true)
+            let current = counter.fetch_add(1, Ordering::Relaxed) + 1;
+            let _ = tx
+                .send(LaunchEvent::Check {
+                    current,
+                    total,
+                    kind: "bundle".into(),
+                })
+                .await;
+
+            match item {
+                AssetItem::CFile { path, content } => {
+                    let dest = PathBuf::from(&path);
+                    if let Some(parent) = dest.parent() {
+                        tokio::fs::create_dir_all(parent).await?;
                     }
-                } else {
-                    true
-                };
+                    if !dest.exists() {
+                        tokio::fs::write(&dest, content).await?;
+                    }
+                    Ok(None)
+                }
 
-                if needs_download {
-                    let folder = dest
-                        .parent()
-                        .map(|p| p.to_path_buf())
-                        .unwrap_or_else(|| PathBuf::from("."));
-
-                    let kind = match item {
-                        AssetItem::NativeAsset { .. } => "natives",
-                        _ => "assets",
+                AssetItem::Asset { ref path, ref sha1, size, ref url }
+                | AssetItem::NativeAsset { ref path, ref sha1, size, ref url } => {
+                    let dest = PathBuf::from(path);
+                    let needs_download = if dest.exists() {
+                        if sha1.is_empty() {
+                            false
+                        } else {
+                            let dest_clone = dest.clone();
+                            let expected = sha1.clone();
+                            tokio::task::spawn_blocking(move || -> bool {
+                                match get_file_hash(&dest_clone, HashAlgorithm::Sha1) {
+                                    Ok(actual) => actual != expected,
+                                    Err(_) => true,
+                                }
+                            })
+                            .await
+                            .unwrap_or(true)
+                        }
+                    } else {
+                        true
                     };
 
-                    pending.push(DownloadItem {
-                        url: url.clone(),
-                        path: dest.clone(),
-                        folder,
-                        name: dest
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_default(),
-                        size: *size,
-                        r#type: Some(kind.into()),
-                        sha1: Some(sha1.clone()),
-                    });
+                    if needs_download {
+                        let folder = dest
+                            .parent()
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or_else(|| PathBuf::from("."));
+
+                        let kind = match item {
+                            AssetItem::NativeAsset { .. } => "natives",
+                            _ => "assets",
+                        };
+
+                        Ok(Some(DownloadItem {
+                            url: url.clone(),
+                            path: dest.clone(),
+                            folder,
+                            name: dest
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                            size,
+                            r#type: Some(kind.into()),
+                            sha1: Some(sha1.clone()),
+                        }))
+                    } else {
+                        Ok(None)
+                    }
                 }
             }
+        });
+    }
+
+    let mut pending: Vec<DownloadItem> = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok(Some(item))) => pending.push(item),
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(e) => return Err(LaunchError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            ))),
         }
     }
 
@@ -240,7 +268,7 @@ mod tests {
             r#"{"objects":{}}"#,
         )];
         let (tx, _rx) = mpsc::channel(16);
-        let pending = check_bundle(&bundle, &tx).await.unwrap();
+        let pending = check_bundle(&bundle, &tx, 4).await.unwrap();
         assert!(pending.is_empty());
         assert!(path.exists());
         let written = std::fs::read_to_string(&path).unwrap();
@@ -255,7 +283,7 @@ mod tests {
 
         let bundle = vec![cfile(&path.to_string_lossy(), "new content")];
         let (tx, _rx) = mpsc::channel(16);
-        check_bundle(&bundle, &tx).await.unwrap();
+        check_bundle(&bundle, &tx, 4).await.unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert_eq!(content, "original");
@@ -268,7 +296,7 @@ mod tests {
         let bundle = vec![asset(&path.to_string_lossy(), "deadbeef", 42, "http://example.com/a.jar")];
 
         let (tx, _rx) = mpsc::channel(16);
-        let pending = check_bundle(&bundle, &tx).await.unwrap();
+        let pending = check_bundle(&bundle, &tx, 4).await.unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].url, "http://example.com/a.jar");
     }
@@ -288,7 +316,7 @@ mod tests {
 
         let bundle = vec![asset(&path.to_string_lossy(), &sha1, 11, "http://example.com/x")];
         let (tx, _rx) = mpsc::channel(16);
-        let pending = check_bundle(&bundle, &tx).await.unwrap();
+        let pending = check_bundle(&bundle, &tx, 4).await.unwrap();
         assert!(pending.is_empty());
     }
 
@@ -300,7 +328,7 @@ mod tests {
 
         let bundle = vec![asset(&path.to_string_lossy(), "0000000000000000000000000000000000000000", 13, "http://example.com/x")];
         let (tx, _rx) = mpsc::channel(16);
-        let pending = check_bundle(&bundle, &tx).await.unwrap();
+        let pending = check_bundle(&bundle, &tx, 4).await.unwrap();
         assert_eq!(pending.len(), 1);
     }
 

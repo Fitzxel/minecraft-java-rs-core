@@ -122,7 +122,7 @@ async fn check_bundle_writes_cfile_and_queues_missing_assets() {
     // CFile has size 0; Asset sizes are summed.
     assert_eq!(total_size, existing_content.len() as u64);
 
-    let pending = check_bundle(&bundle, &tx).await.unwrap();
+    let pending = check_bundle(&bundle, &tx, 4).await.unwrap();
     drain_channel(&mut rx);
 
     // CFile must have been written to disk (including its parent directory).
@@ -177,7 +177,7 @@ async fn check_bundle_native_asset_queued_when_missing() {
     let total = get_total_size(&bundle);
     assert_eq!(total, 512);
 
-    let pending = check_bundle(&bundle, &tx).await.unwrap();
+    let pending = check_bundle(&bundle, &tx, 4).await.unwrap();
     drain_channel(&mut rx);
 
     assert_eq!(pending.len(), 1);

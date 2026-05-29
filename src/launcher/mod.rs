@@ -103,7 +103,7 @@ impl Launcher {
         let java_result = get_java_files(options, &version_json, &client, &event_tx).await?;
 
         // ── Bundle integrity check & download ─────────────────────────────────
-        let pending = check_bundle(&bundle, &event_tx).await?;
+        let pending = check_bundle(&bundle, &event_tx, options.clamped_verify_concurrency()).await?;
         if !pending.is_empty() {
             let downloader = Downloader::new(options.timeout_secs, options.download_concurrency);
             downloader
@@ -153,7 +153,7 @@ impl Launcher {
         // download them here.  When --installClient was used the files already
         // exist and check_bundle returns an empty pending list immediately.
         if !loader_libraries.is_empty() {
-            let loader_pending = check_bundle(&loader_libraries, &event_tx).await?;
+            let loader_pending = check_bundle(&loader_libraries, &event_tx, options.clamped_verify_concurrency()).await?;
             if !loader_pending.is_empty() {
                 let downloader =
                     Downloader::new(options.timeout_secs, options.download_concurrency);
