@@ -178,7 +178,6 @@ mod tests {
                 uuid: "test-uuid".into(),
                 xbox_account: None,
                 user_properties: None,
-                meta: None,
                 client_id: None,
                 client_token: None,
             },

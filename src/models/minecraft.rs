@@ -192,8 +192,6 @@ pub struct Authenticator {
     #[serde(default)]
     pub user_properties: Option<String>,
     #[serde(default)]
-    pub meta: Option<AuthMeta>,
-    #[serde(default)]
     pub client_id: Option<String>,
     #[serde(default)]
     pub client_token: Option<String>,
@@ -204,8 +202,3 @@ pub struct XboxAccount {
     pub xuid: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct AuthMeta {
-    #[serde(rename = "type")]
-    pub auth_type: String,
-}
