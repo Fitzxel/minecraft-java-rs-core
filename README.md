@@ -31,6 +31,7 @@ use minecraft_java_rs_core::{
         Launcher,
     },
     models::{loader::LoaderType, minecraft::Authenticator},
+    utils::auth::offline_uuid,
 };
 use tokio::sync::mpsc;
 
@@ -40,7 +41,7 @@ async fn main() {
     let auth = Authenticator {
         access_token: "offline".into(),
         name: "Steve".into(),
-        uuid: "00000000-0000-0000-0000-000000000001".into(),
+        uuid: offline_uuid("Steve"),
         xbox_account: None,
         user_properties: None,
         client_id: None,
@@ -137,6 +138,23 @@ let loader = LoaderConfig {
 Available loader types: `Forge`, `NeoForge`, `Fabric`, `LegacyFabric`, `Quilt`.
 
 Valid `build` values: `"latest"`, `"recommended"`, or an exact version string (e.g. `"0.19.2"`).
+
+## Utilities
+
+### `offline_uuid`
+
+Generates a deterministic offline UUID from a username. Useful when building
+your own offline-mode `Authenticator` without a real Microsoft account.
+
+```rust
+use minecraft_java_rs_core::utils::auth::offline_uuid;
+
+let uuid = offline_uuid("Steve");
+// e.g. "2a6b3c4d-1e2f-3a4b-8c9d-0e1f2a3b4c5d"
+```
+
+The same username always produces the same UUID, so the player's inventory and
+world progress are preserved across sessions.
 
 ## Download only (no launch)
 

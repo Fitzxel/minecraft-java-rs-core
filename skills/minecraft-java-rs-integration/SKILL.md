@@ -75,15 +75,17 @@ launcher.launch(tx).await?          // reads from self.game_data or disk cache
 use minecraft_java_rs_core::{
     launcher::{events::LaunchEvent, options::LaunchOptions, Launcher},
     models::minecraft::Authenticator,
+    utils::auth::offline_uuid,
 };
 use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() {
+    let uuid = offline_uuid("Steve");
     let auth = Authenticator {
         access_token: "offline".into(),
         name: "Steve".into(),
-        uuid: "00000000-0000-0000-0000-000000000001".into(),
+        uuid,
         xbox_account: None,
         user_properties: None,
         client_id: None,

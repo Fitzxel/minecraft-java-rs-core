@@ -39,6 +39,7 @@ use std::{io::Write, path::PathBuf, time::Duration};
 use minecraft_java_rs_core::{
     launcher::{options::LaunchOptions, LaunchEvent, Launcher},
     models::{loader::LoaderType, minecraft::Authenticator},
+    utils::auth::offline_uuid,
 };
 use tokio::{sync::mpsc, time::sleep};
 
@@ -136,28 +137,6 @@ EXAMPLES:
   cargo run --example launch -- --loader-type forge --loader-build 47.4.10
 "#
     );
-}
-
-// ── Offline UUID (deterministic from username, FNV-1a based) ─────────────────
-
-fn offline_uuid(username: &str) -> String {
-    // Deterministic UUID v3-style from username — enough for offline play.
-    let mut a = 0xcbf29ce484222325u64;
-    let mut b = 0x14650fb0739d0383u64;
-    for byte in username.bytes() {
-        a ^= byte as u64;
-        a = a.wrapping_mul(0x100000001b3);
-        b ^= a;
-        b = b.wrapping_mul(0x517cc1b727220a95);
-    }
-    format!(
-        "{:08x}-{:04x}-3{:03x}-{:04x}-{:012x}",
-        (b >> 32) as u32,
-        (b >> 16) as u16,
-        b as u16 & 0x0fff,
-        ((a >> 48) as u16 & 0x3fff) | 0x8000,
-        a & 0x0000_ffff_ffff_ffff
-    )
 }
 
 // ── Event printer ─────────────────────────────────────────────────────────────
