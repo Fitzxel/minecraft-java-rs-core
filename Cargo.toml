@@ -5,6 +5,8 @@ edition = "2021"
 description = "Core library for launching Minecraft Java Edition"
 repository = "https://github.com/fitzxel/minecraft-java-rs-core"
 license = "MIT"
+keywords = ["minecraft", "launcher", "java", "client", "core"]
+categories = ["games"]
 
 [dependencies]
 # Async runtime
