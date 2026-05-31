@@ -125,15 +125,15 @@ async fn main() {
 
 ## 4. Microsoft authentication
 
-Uses [`minecraft-msa-auth`](https://github.com/minecraft-rs/minecraft-msa-auth) (available on crates.io).
+Uses [`minecraft-msa-auth`](https://github.com/minecraft-rs/minecraft-msa-auth).
 
 ```toml
-minecraft-msa-auth = "0.2"
+minecraft-msa-auth = { git = "https://github.com/minecraft-rs/minecraft-msa-auth" }
 ```
 
 **What the library does:** takes a raw Microsoft OAuth2 access token string and handles the
-Xbox Live → XSTS → Minecraft login chain. It does **not** do the OAuth2 browser/device-code
-step — you handle that yourself.
+Xbox Live → XSTS → Minecraft login chain. It does **not** do the OAuth2 device-code step —
+you handle that yourself with plain HTTP calls.
 
 **API surface:**
 ```rust
@@ -151,84 +151,106 @@ mc_token.expires_in()    // u32 seconds
 > After `exchange_microsoft_token` you must separately call the Minecraft profile API
 > to get the actual display name and UUID.
 
-### Full flow (browser redirect + local callback server)
+### reqwest version conflict
+
+`minecraft-msa-auth` depends on **reqwest 0.13**, which is a different crate version than
+the 0.12 used by `minecraft-java-rs-core`. If your project already depends on reqwest 0.12
+you must alias reqwest 0.13 under a different name to avoid type mismatches:
+
+```toml
+# your existing reqwest (0.12) stays unchanged
+reqwest = { version = "0.12", ... }
+
+# alias for passing a Client to MinecraftAuthorizationFlow
+reqwest_v13 = { package = "reqwest", version = "0.13", default-features = false, features = ["json", "rustls"] }
+```
+
+Then in code: `use reqwest_v13::Client as MsaClient;`
+
+### Full flow (device code — no browser redirect needed)
+
+Register your Azure app at [portal.azure.com](https://portal.azure.com): public client,
+no redirect URI needed for device code, scope: `XboxLive.signin offline_access`.
 
 ```rust
-use minecraft_java_rs_core::{
-    models::minecraft::Authenticator,
-    utils::auth::offline_uuid,
-};
+use std::time::Duration;
+use minecraft_java_rs_core::{models::minecraft::Authenticator, utils::auth::offline_uuid};
 use minecraft_msa_auth::MinecraftAuthorizationFlow;
-use reqwest::Client;
-use serde_json::Value;
-use tiny_http::{Header, Response, Server};
+use serde::Deserialize;
 
 const CLIENT_ID: &str = "YOUR_AZURE_CLIENT_ID";
-const REDIRECT_URI: &str = "http://localhost:7878/callback";
+const DEVICE_CODE_URL: &str = "https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode";
+const TOKEN_URL: &str     = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token";
+const MC_PROFILE_URL: &str = "https://api.minecraftservices.com/minecraft/profile";
 
-async fn microsoft_auth() -> Result<Authenticator, String> {
-    // 1. Open the browser for Microsoft login
-    let auth_url = format!(
-        "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize\
-         ?client_id={CLIENT_ID}\
-         &response_type=code\
-         &redirect_uri={REDIRECT_URI}\
-         &scope=XboxLive.signin%20offline_access\
-         &prompt=select_account"
-    );
-    open::that(auth_url).map_err(|e| e.to_string())?;
+#[derive(Deserialize)]
+struct DeviceCodeResponse {
+    device_code: String, user_code: String, verification_uri: String,
+    expires_in: u64, interval: u64,
+}
 
-    // 2. Wait for the OAuth2 callback code on a local HTTP server
-    let server = Server::http("127.0.0.1:7878").map_err(|e| e.to_string())?;
-    let code = loop {
-        let req = server.recv().map_err(|e| e.to_string())?;
-        let url = req.url().to_string();
-        if url.starts_with("/callback") {
-            if let Some(code) = url.split("code=").nth(1) {
-                let code = code.split('&').next().unwrap_or("").to_string();
-                let _ = req.respond(Response::from_string("Login successful. You can close this window.")
-                    .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/html"[..]).unwrap()));
-                break code;
-            }
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TokenPoll { Success { access_token: String }, Pending { error: String } }
+
+#[derive(Deserialize)]
+struct McProfile { id: String, name: String }
+
+async fn microsoft_auth() -> Result<Authenticator, Box<dyn std::error::Error>> {
+    let http = reqwest::Client::new(); // reqwest 0.12 for OAuth HTTP calls
+
+    // 1. Request a device code
+    let dc: DeviceCodeResponse = http.post(DEVICE_CODE_URL)
+        .form(&[("client_id", CLIENT_ID), ("scope", "XboxLive.signin offline_access")])
+        .send().await?.error_for_status()?.json().await?;
+
+    println!("Open: {}\nEnter code: {}", dc.verification_uri, dc.user_code);
+
+    // 2. Poll until the user logs in
+    let interval = Duration::from_secs(dc.interval.max(5));
+    let deadline = std::time::Instant::now() + Duration::from_secs(dc.expires_in);
+
+    let msa_token = loop {
+        tokio::time::sleep(interval).await;
+        if std::time::Instant::now() > deadline {
+            return Err("device code expired".into());
+        }
+        let resp: TokenPoll = http.post(TOKEN_URL)
+            .form(&[
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ("client_id", CLIENT_ID),
+                ("device_code", dc.device_code.as_str()),
+            ])
+            .send().await?.json().await?;
+        match resp {
+            TokenPoll::Success { access_token } => break access_token,
+            TokenPoll::Pending { error } if error == "authorization_pending" => continue,
+            TokenPoll::Pending { error } => return Err(error.into()),
         }
     };
 
-    // 3. Exchange code → MS access + refresh tokens
-    let client = Client::new();
-    let res: Value = client
-        .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token")
-        .form(&[
-            ("client_id", CLIENT_ID),
-            ("code", code.as_str()),
-            ("grant_type", "authorization_code"),
-            ("redirect_uri", REDIRECT_URI),
-        ])
-        .send().await.map_err(|e| e.to_string())?
-        .json().await.map_err(|e| e.to_string())?;
+    // 3. MSA token → Minecraft token (Xbox Live + XSTS handled internally)
+    // Note: MinecraftAuthorizationFlow requires a reqwest 0.13 Client.
+    // If your project uses reqwest 0.12, alias it (see "reqwest version conflict" above).
+    let mc_flow = MinecraftAuthorizationFlow::new(reqwest_v13::Client::new());
+    let mc_token = mc_flow.exchange_microsoft_token(&msa_token).await?;
+    let minecraft_access_token = mc_token.access_token().as_ref().to_owned();
 
-    let ms_access_token = res["access_token"].as_str().ok_or("no access_token")?.to_string();
-    // store res["refresh_token"] if you need to refresh later
+    // 4. Fetch real Minecraft name + UUID via profile API
+    // mc_token.username() is the Xbox UUID — do NOT use it as the player UUID.
+    // Mojang returns the UUID without dashes; add them back.
+    let profile: McProfile = http.get(MC_PROFILE_URL)
+        .bearer_auth(&minecraft_access_token)
+        .send().await?.error_for_status()?.json().await?;
 
-    // 4. MS token → Minecraft token (handles Xbox Live + XSTS internally)
-    let mc_flow = MinecraftAuthorizationFlow::new(Client::new());
-    let mc_token = mc_flow
-        .exchange_microsoft_token(&ms_access_token)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // 5. Fetch the real Minecraft name + UUID (mc_token.username() is the Xbox UUID, not usable here)
-    let profile: Value = client
-        .get("https://api.minecraftservices.com/minecraft/profile")
-        .bearer_auth(mc_token.access_token().as_ref())
-        .send().await.map_err(|e| e.to_string())?
-        .json().await.map_err(|e| e.to_string())?;
-
-    let name = profile["name"].as_str().ok_or("no name")?.to_string();
-    let uuid = profile["id"].as_str().ok_or("no id")?.to_string();
+    let raw = &profile.id;
+    let uuid = if raw.len() == 32 {
+        format!("{}-{}-{}-{}-{}", &raw[..8], &raw[8..12], &raw[12..16], &raw[16..20], &raw[20..])
+    } else { raw.clone() };
 
     Ok(Authenticator {
-        access_token: mc_token.access_token().as_ref().to_string(),
-        name,
+        access_token: minecraft_access_token,
+        name: profile.name,
         uuid,
         xbox_account: None,
         user_properties: None,
@@ -237,9 +259,6 @@ async fn microsoft_auth() -> Result<Authenticator, String> {
     })
 }
 ```
-
-> Register your Azure app at [portal.azure.com](https://portal.azure.com) (type: public client,
-> redirect URI: `http://localhost:7878/callback`, scope: `XboxLive.signin offline_access`).
 
 ---
 
