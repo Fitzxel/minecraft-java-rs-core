@@ -125,51 +125,121 @@ async fn main() {
 
 ## 4. Microsoft authentication
 
-Uses [`minecraft-msa-auth`](https://github.com/minecraft-rs/minecraft-msa-auth).
-The flow is: device code → Microsoft token → Xbox → Minecraft token → profile.
+Uses [`minecraft-msa-auth`](https://github.com/minecraft-rs/minecraft-msa-auth) (available on crates.io).
+
+```toml
+minecraft-msa-auth = "0.2"
+```
+
+**What the library does:** takes a raw Microsoft OAuth2 access token string and handles the
+Xbox Live → XSTS → Minecraft login chain. It does **not** do the OAuth2 browser/device-code
+step — you handle that yourself.
+
+**API surface:**
+```rust
+MinecraftAuthorizationFlow::new(http_client: reqwest::Client) -> Self
+flow.exchange_microsoft_token(ms_access_token: impl AsRef<str>)
+    -> Result<MinecraftAuthenticationResponse, MinecraftAuthorizationError>
+
+// MinecraftAuthenticationResponse fields (via getters):
+mc_token.access_token()  // &MinecraftAccessToken — use .as_ref() for the raw &str
+mc_token.username()      // Xbox UUID string — NOT the Minecraft display name or UUID
+mc_token.expires_in()    // u32 seconds
+```
+
+> `mc_token.username()` is the **Xbox UUID**, not the Minecraft player name or UUID.
+> After `exchange_microsoft_token` you must separately call the Minecraft profile API
+> to get the actual display name and UUID.
+
+### Full flow (browser redirect + local callback server)
 
 ```rust
-use minecraft_java_rs_core::models::minecraft::Authenticator;
+use minecraft_java_rs_core::{
+    models::minecraft::Authenticator,
+    utils::auth::offline_uuid,
+};
 use minecraft_msa_auth::MinecraftAuthorizationFlow;
-use oauth2::basic::BasicClient;
-use oauth2::{AuthUrl, ClientId, DeviceAuthorizationUrl, TokenUrl};
+use reqwest::Client;
+use serde_json::Value;
+use tiny_http::{Header, Response, Server};
 
-async fn microsoft_auth() -> Authenticator {
-    // Register an Azure app at https://portal.azure.com to get a client ID.
-    let client = BasicClient::new(
-        ClientId::new("YOUR_AZURE_CLIENT_ID".into()),
-        None,
-        AuthUrl::new("https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize".into()).unwrap(),
-        Some(TokenUrl::new("https://login.microsoftonline.com/consumers/oauth2/v2.0/token".into()).unwrap()),
-    )
-    .set_device_authorization_url(
-        DeviceAuthorizationUrl::new("https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode".into()).unwrap(),
+const CLIENT_ID: &str = "YOUR_AZURE_CLIENT_ID";
+const REDIRECT_URI: &str = "http://localhost:7878/callback";
+
+async fn microsoft_auth() -> Result<Authenticator, String> {
+    // 1. Open the browser for Microsoft login
+    let auth_url = format!(
+        "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize\
+         ?client_id={CLIENT_ID}\
+         &response_type=code\
+         &redirect_uri={REDIRECT_URI}\
+         &scope=XboxLive.signin%20offline_access\
+         &prompt=select_account"
     );
+    open::that(auth_url).map_err(|e| e.to_string())?;
 
-    let http = reqwest::Client::new();
-    let flow = MinecraftAuthorizationFlow::new(http.clone());
+    // 2. Wait for the OAuth2 callback code on a local HTTP server
+    let server = Server::http("127.0.0.1:7878").map_err(|e| e.to_string())?;
+    let code = loop {
+        let req = server.recv().map_err(|e| e.to_string())?;
+        let url = req.url().to_string();
+        if url.starts_with("/callback") {
+            if let Some(code) = url.split("code=").nth(1) {
+                let code = code.split('&').next().unwrap_or("").to_string();
+                let _ = req.respond(Response::from_string("Login successful. You can close this window.")
+                    .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/html"[..]).unwrap()));
+                break code;
+            }
+        }
+    };
 
-    // 1. Get device code — show the URL and code to the user
-    let details = flow.get_device_code(&client).await.unwrap();
-    println!("Open {} and enter code: {}", details.verification_uri(), details.user_code().secret());
+    // 3. Exchange code → MS access + refresh tokens
+    let client = Client::new();
+    let res: Value = client
+        .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token")
+        .form(&[
+            ("client_id", CLIENT_ID),
+            ("code", code.as_str()),
+            ("grant_type", "authorization_code"),
+            ("redirect_uri", REDIRECT_URI),
+        ])
+        .send().await.map_err(|e| e.to_string())?
+        .json().await.map_err(|e| e.to_string())?;
 
-    // 2. Poll until the user logs in
-    let msa_token = flow.poll_device_code(details, &client).await.unwrap();
+    let ms_access_token = res["access_token"].as_str().ok_or("no access_token")?.to_string();
+    // store res["refresh_token"] if you need to refresh later
 
-    // 3. Exchange MSA token → Minecraft profile
-    let mc_profile = flow.get_minecraft_profile(&msa_token).await.unwrap();
+    // 4. MS token → Minecraft token (handles Xbox Live + XSTS internally)
+    let mc_flow = MinecraftAuthorizationFlow::new(Client::new());
+    let mc_token = mc_flow
+        .exchange_microsoft_token(&ms_access_token)
+        .await
+        .map_err(|e| e.to_string())?;
 
-    Authenticator {
-        access_token: mc_profile.access_token,
-        name: mc_profile.username,
-        uuid: mc_profile.uuid.to_string(),
+    // 5. Fetch the real Minecraft name + UUID (mc_token.username() is the Xbox UUID, not usable here)
+    let profile: Value = client
+        .get("https://api.minecraftservices.com/minecraft/profile")
+        .bearer_auth(mc_token.access_token().as_ref())
+        .send().await.map_err(|e| e.to_string())?
+        .json().await.map_err(|e| e.to_string())?;
+
+    let name = profile["name"].as_str().ok_or("no name")?.to_string();
+    let uuid = profile["id"].as_str().ok_or("no id")?.to_string();
+
+    Ok(Authenticator {
+        access_token: mc_token.access_token().as_ref().to_string(),
+        name,
+        uuid,
         xbox_account: None,
         user_properties: None,
-        client_id: Some("YOUR_AZURE_CLIENT_ID".into()),
+        client_id: Some(CLIENT_ID.into()),
         client_token: None,
-    }
+    })
 }
 ```
+
+> Register your Azure app at [portal.azure.com](https://portal.azure.com) (type: public client,
+> redirect URI: `http://localhost:7878/callback`, scope: `XboxLive.signin offline_access`).
 
 ---
 
