@@ -57,7 +57,7 @@ pub async fn get_java_files(
         .join(&component)
         .join(&platform);
 
-    let java_bin = java_bin_path(&runtime_root);
+    let java_bin = find_cached_java_bin(&runtime_root);
 
     if java_bin.exists() {
         return Ok(JavaDownloadResult {
@@ -122,6 +122,25 @@ pub fn java_bin_path(runtime_root: &Path) -> PathBuf {
         "java"
     };
     runtime_root.join("bin").join(bin)
+}
+
+/// Like `java_bin_path` but also checks the macOS bundle layout used by some
+/// Mojang runtimes (e.g. jre-legacy): `jre.bundle/Contents/Home/bin/java`.
+/// Returns the first path that exists on disk, or the standard path as a
+/// fallback so callers can still attempt the download.
+fn find_cached_java_bin(runtime_root: &Path) -> PathBuf {
+    let primary = java_bin_path(runtime_root);
+    if primary.exists() {
+        return primary;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let bundle = runtime_root.join("jre.bundle/Contents/Home/bin/java");
+        if bundle.exists() {
+            return bundle;
+        }
+    }
+    primary
 }
 
 fn adoptium_os() -> &'static str {
@@ -236,7 +255,26 @@ async fn try_mojang(
         }
     }
 
-    let java_bin = java_bin_path(runtime_root);
+    // Find the java binary by scanning manifest entries — some Mojang runtimes
+    // on macOS use a bundle layout (e.g. jre.bundle/Contents/Home/bin/java)
+    // rather than the flat bin/java expected by java_bin_path.
+    let java_bin = manifest.files.iter()
+        .filter_map(|(rel_path, entry)| {
+            if entry.executable != Some(true) {
+                return None;
+            }
+            let p = std::path::Path::new(rel_path);
+            let fname = p.file_name()?.to_str()?;
+            let in_bin = p.parent()?.file_name()?.to_str()? == "bin";
+            if in_bin && (fname == "java" || fname == "javaw.exe") {
+                Some(runtime_root.join(rel_path))
+            } else {
+                None
+            }
+        })
+        .next()
+        .unwrap_or_else(|| java_bin_path(runtime_root));
+
     Ok(Some(JavaDownloadResult {
         java_path: java_bin.to_string_lossy().into_owned(),
         files: file_records,
