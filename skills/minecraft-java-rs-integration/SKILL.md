@@ -545,11 +545,33 @@ let mut launcher = Launcher::new(options);
 let mut child = launcher.launch(tx).await?;  // errors with GameDataNotReady if no cache
 ```
 
-### Fast re-launch with corrupt install detection
+### Fast re-launch (skipping bundle check)
 
-`skip_bundle_check: true` makes `download_game` return immediately by loading the
-existing `gameData.json` from disk, skipping all network calls and SHA-1 checks.
-If the cache is absent it falls through to the normal download path silently.
+`launch()` never runs a bundle check — it only reads `gameData.json` and spawns
+the process. **This is the preferred fast-launch path** when the caller knows the
+game is already installed: just call `launch()` directly without a prior
+`download_game()` call. It loads the persisted cache from disk automatically.
+
+```rust
+// Fastest possible re-launch — no network, no SHA-1 checks, no download step.
+let mut launcher = Launcher::new(options);
+let mut child = launcher.launch(tx).await?;  // reads gameData.json from disk
+child.wait().await.ok();
+```
+
+`skip_bundle_check: true` on `LaunchOptions` is only relevant when the caller
+goes through `download_game()` and still wants to avoid the SHA-1 scan (e.g.
+when using `start()` or building a fresh `Launcher` each session). If the cache
+is absent it falls through to the full download path silently.
+
+### Corrupt install detection
+
+After the process exits, call `Launcher::is_corrupt_crash` with the exit code and
+the collected `LaunchEvent::Data` log lines. It returns `true` when the exit code
+is non-zero **and** the logs contain a known corrupt-install pattern
+(`NoClassDefFoundError`, `Unable to access jarfile`, `ZipException`, etc.).
+Re-run `download_game()` with `skip_bundle_check: false` to trigger a full
+re-verification.
 
 After the process exits, call `Launcher::is_corrupt_crash` with the exit code and
 the collected `LaunchEvent::Data` log lines. It returns `true` when the exit code
