@@ -242,11 +242,16 @@ impl Launcher {
         // take precedence over vanilla when there are collisions.
         let mut bundle: Vec<AssetItem> = game_data.loader_libraries.clone();
         let mut vanilla_libs = get_libraries(options, version_json);
-        // Forge/NeoForge: exclude the vanilla Minecraft client JAR from the classpath.
-        // The bootstraplauncher manages Minecraft classes via client-slim.jar in its
-        // library directory. Including the full vanilla jar causes split-package
-        // conflicts in the Java module layer (_1._20._1 vs minecraft modules).
-        if matches!(game_data.loader_type, Some(LoaderType::Forge) | Some(LoaderType::NeoForge)) {
+        // Modern Forge (1.17+) and NeoForge use the bootstraplauncher which manages
+        // Minecraft classes via client-slim.jar. Including the full vanilla jar
+        // causes split-package conflicts in the Java module layer.
+        // Old Forge (pre-1.17, no module path args) uses FML's class patcher which
+        // needs the vanilla jar directly on the classpath — don't exclude it there.
+        let uses_module_path = game_data.loader_extra_jvm_args.iter()
+            .any(|a| a == "-p" || a == "--module-path");
+        let exclude_vanilla_jar = matches!(game_data.loader_type, Some(LoaderType::NeoForge))
+            || (matches!(game_data.loader_type, Some(LoaderType::Forge)) && uses_module_path);
+        if exclude_vanilla_jar {
             let mc_jar = options
                 .path
                 .join("versions")
@@ -372,6 +377,26 @@ impl Launcher {
         if std::env::var_os("DISPLAY").is_some() {
             cmd.env_remove("WAYLAND_DISPLAY");
             cmd.env("GLFW_PLATFORM", "x11");
+        }
+
+        // LWJGL 2 (old Minecraft, pre-1.13) runs `xrandr` at startup via
+        // Runtime.exec() to enumerate display modes. If xrandr is not installed
+        // the subprocess returns nothing, getScreenNames() returns an empty
+        // array, and LinuxDisplay:951 throws ArrayIndexOutOfBoundsException: 0.
+        // Fix: if xrandr is missing, drop a minimal stub script into a cache
+        // dir and prepend that dir to PATH so Java finds it first.
+        #[cfg(target_os = "linux")]
+        if crate::game::lwjgl_native::uses_lwjgl2(version_json)
+            && !crate::game::lwjgl_native::xrandr_in_path()
+        {
+            let stub_dir = options.path.join("cache").join("xrandr-stub");
+            if crate::game::lwjgl_native::write_xrandr_stub(&stub_dir).await.is_ok() {
+                let base_path = std::env::var("PATH").unwrap_or_default();
+                cmd.env(
+                    "PATH",
+                    format!("{}:{}", stub_dir.to_string_lossy(), base_path),
+                );
+            }
         }
 
         let mut child = cmd.spawn()

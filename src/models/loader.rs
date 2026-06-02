@@ -44,6 +44,9 @@ pub struct LoaderLibrary {
     /// When present (any value), this library should be skipped.
     #[serde(default)]
     pub rules: Option<Vec<Value>>,
+    /// Old-format Forge only: `false` means this library is server-only.
+    #[serde(default)]
+    pub clientreq: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -147,6 +150,9 @@ pub struct ForgeProfile {
     pub path: Option<String>,
     pub processors: Option<Vec<ForgeProcessor>>,
     pub libraries: Option<Vec<LoaderLibrary>>,
+    /// Old-format (pre-1.13) Forge: the full version JSON embedded inline.
+    #[serde(rename = "versionInfo", default)]
+    pub version_info: Option<ForgeVersionSection>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default)]

@@ -107,6 +107,67 @@ struct LwjglLibrarySet {
     libraries: Vec<Library>,
 }
 
+// ── LWJGL 2 / XRandR stub (Linux) ────────────────────────────────────────────
+
+/// Returns `true` if the game uses LWJGL 2 (`org.lwjgl.lwjgl:lwjgl:2.x`).
+///
+/// LWJGL 2's `XRandR.java` runs the `xrandr` binary at startup to enumerate
+/// display modes. On Linux systems where `xrandr` is not installed, the
+/// subprocess returns no output and `getScreenNames()` returns an empty array,
+/// causing `ArrayIndexOutOfBoundsException: 0` in `LinuxDisplay:951`.
+pub fn uses_lwjgl2(version: &MinecraftVersionJson) -> bool {
+    version
+        .libraries
+        .iter()
+        .any(|lib| lib.name.starts_with("org.lwjgl.lwjgl:lwjgl:2."))
+}
+
+/// Returns `true` if the `xrandr` binary is found in the current `PATH`.
+#[cfg(target_os = "linux")]
+pub fn xrandr_in_path() -> bool {
+    std::env::var_os("PATH")
+        .map(|p| {
+            std::env::split_paths(&p)
+                .any(|dir| dir.join("xrandr").is_file())
+        })
+        .unwrap_or(false)
+}
+
+/// Write a minimal `xrandr` stub script into `dir` and make it executable.
+///
+/// The stub outputs just enough xrandr-compatible text for LWJGL 2's
+/// `XRandR.java` parser: a connected screen header and one resolution line.
+/// It tries `xdpyinfo` for the actual resolution and falls back to 1920×1080.
+///
+/// Idempotent — safe to call on every launch; skips the write if the file
+/// already exists.
+#[cfg(target_os = "linux")]
+pub async fn write_xrandr_stub(dir: &std::path::Path) -> Result<(), LaunchError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let stub = dir.join("xrandr");
+    if stub.exists() {
+        return Ok(());
+    }
+    tokio::fs::create_dir_all(dir).await?;
+
+    let script = "\
+#!/bin/sh
+# Minimal xrandr stub — used by LWJGL 2 on systems without the real xrandr.
+W=1920; H=1080
+if command -v xdpyinfo >/dev/null 2>&1; then
+    RES=$(xdpyinfo 2>/dev/null | awk '/dimensions:/{print $2}' | head -1)
+    if [ -n \"$RES\" ]; then W=${RES%x*}; H=${RES#*x}; fi
+fi
+printf 'Screen 0: minimum 8 x 8, current %s x %s, maximum 32767 x 32767\\n' \"$W\" \"$H\"
+printf 'HDMI-1 connected %sx%s+0+0 (normal left inverted right x axis y axis) 0mm x 0mm\\n' \"$W\" \"$H\"
+printf '   %sx%s       60.00*+\\n' \"$W\" \"$H\"
+";
+    tokio::fs::write(&stub, script).await?;
+    tokio::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).await?;
+    Ok(())
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

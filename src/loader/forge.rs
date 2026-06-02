@@ -370,6 +370,10 @@ fn build_library_assets(loader_base: &Path, version: &ForgeVersionSection) -> Ve
         if lib.rules.is_some() {
             continue;
         }
+        // Old-format Forge marks server-only libraries with clientreq: false.
+        if lib.clientreq == Some(false) {
+            continue;
+        }
 
         let (path, sha1, size, url) = resolve_library_entry(loader_base, lib);
         items.push(AssetItem::Asset { path, sha1, size, url });
@@ -399,12 +403,45 @@ fn resolve_library_entry(
 
     let sha1 = artifact.and_then(|a| a.sha1.clone()).unwrap_or_default();
     let size = artifact.and_then(|a| a.size).unwrap_or(0);
-    let url = artifact.map(|a| a.url.clone()).unwrap_or_default();
+    // For old-format Forge libs that have no downloads.artifact, construct the
+    // URL from the lib's base `url` + relative Maven path, or fall back to the
+    // standard Minecraft library repo (used by launchwrapper, asm-all, etc.).
+    let url = artifact
+        .map(|a| a.url.clone())
+        .filter(|u| !u.is_empty())
+        .or_else(|| {
+            lib.url.as_ref().filter(|u| !u.is_empty()).map(|base| {
+                format!("{}/{}", base.trim_end_matches('/'), &rel_path)
+            })
+        })
+        .or_else(|| {
+            if !rel_path.is_empty() {
+                Some(format!("https://libraries.minecraft.net/{rel_path}"))
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
 
     (abs_path.to_string_lossy().into_owned(), sha1, size, url)
 }
 
 // ── Build resolution helpers ──────────────────────────────────────────────────
+
+/// Older Forge builds append `-{mc_version}` to the build number in the Maven
+/// artifact ID (e.g. `1.8.9-11.15.1.2318-1.8.9`), while the promotions API
+/// returns only the bare build number. Try the plain candidate first; if it
+/// isn't in the versions list, try the suffixed form.
+fn match_promo_in_versions(candidate: &str, mc_version: &str, versions: &[String]) -> String {
+    if versions.iter().any(|v| v == candidate) {
+        return candidate.to_owned();
+    }
+    let with_suffix = format!("{candidate}-{mc_version}");
+    if versions.iter().any(|v| v == &with_suffix) {
+        return with_suffix;
+    }
+    candidate.to_owned()
+}
 
 async fn resolve_forge_build(
     build: &str,
@@ -418,7 +455,8 @@ async fn resolve_forge_build(
                 if let Ok(p) = promos.json::<Promotions>().await {
                     let key = format!("{mc_version}-latest");
                     if let Some(ver) = p.promos.get(&key) {
-                        return Ok(format!("{mc_version}-{ver}"));
+                        let candidate = format!("{mc_version}-{ver}");
+                        return Ok(match_promo_in_versions(&candidate, mc_version, versions));
                     }
                 }
             }
@@ -434,7 +472,8 @@ async fn resolve_forge_build(
                     let lat_key = format!("{mc_version}-latest");
                     let ver = p.promos.get(&rec_key).or_else(|| p.promos.get(&lat_key));
                     if let Some(v) = ver {
-                        return Ok(format!("{mc_version}-{v}"));
+                        let candidate = format!("{mc_version}-{v}");
+                        return Ok(match_promo_in_versions(&candidate, mc_version, versions));
                     }
                 }
             }
@@ -511,9 +550,13 @@ async fn try_patcher_install_inner(
     let profile = read_install_profile(installer_path).await?;
 
     // 2. New-format profiles have processors; old-format ones don't.
-    //    Without processors the patcher has nothing to do.
     let has_processors = profile.processors.as_ref().map_or(false, |p| !p.is_empty());
     if !has_processors {
+        // Old-format (pre-1.13): versionInfo is inline in install_profile.json.
+        if profile.version_info.is_some() {
+            install_old_forge_legacy(installer_path, loader_base, version_json_path, &profile, event_tx).await?;
+            return Ok(true);
+        }
         return Ok(false);
     }
 
@@ -585,6 +628,55 @@ async fn read_install_profile(installer_path: &str) -> Result<ForgeProfile, Load
 }
 
 /// Extract `version.json` from the installer JAR to `dest_path`.
+/// Install old-format Forge (pre-1.13): write versionInfo as the version JSON
+/// and extract the bundled universal JAR into the loader's Maven libs tree.
+/// No processors exist in this format; the universal JAR IS the Forge runtime.
+async fn install_old_forge_legacy(
+    installer_path: &str,
+    loader_base: &Path,
+    version_json_path: &Path,
+    profile: &ForgeProfile,
+    event_tx: &Sender<LaunchEvent>,
+) -> Result<(), LoaderError> {
+    let version_info = profile.version_info.as_ref().expect("caller checked Some");
+
+    if let Some(parent) = version_json_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(version_json_path, serde_json::to_vec_pretty(version_info)?).await?;
+    let _ = event_tx.send(LaunchEvent::Patch("[patcher] Old-format Forge: wrote version JSON".into())).await;
+
+    if let Some(install) = &profile.install {
+        if let (Some(file_in_zip), Some(maven_coord)) = (&install.file_path, &install.path) {
+            if let Ok(lib_info) = get_path_libraries(maven_coord, None, None) {
+                let dest = loader_base.join("libraries").join(&lib_info.path).join(&lib_info.name);
+                if !dest.exists() {
+                    let result = get_file_from_archive(
+                        PathBuf::from(installer_path),
+                        Some(file_in_zip.clone()),
+                        None,
+                        false,
+                    )
+                    .await
+                    .map_err(|e| LoaderError::Archive(e.to_string()))?;
+
+                    if let ArchiveQueryResult::FileData(bytes) = result {
+                        if let Some(parent) = dest.parent() {
+                            tokio::fs::create_dir_all(parent).await?;
+                        }
+                        tokio::fs::write(&dest, bytes).await?;
+                        let _ = event_tx
+                            .send(LaunchEvent::Patch(format!("[patcher] Old-format Forge: extracted {}", lib_info.name)))
+                            .await;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 async fn extract_version_json(installer_path: &str, dest_path: &Path) -> Result<(), LoaderError> {
     let result = get_file_from_archive(
         PathBuf::from(installer_path),
@@ -859,6 +951,7 @@ mod tests {
                     }),
                 }),
                 rules: None,
+                clientreq: None,
             }]),
             main_class: None,
             minecraft_arguments: None,
@@ -886,6 +979,7 @@ mod tests {
                 url: None,
                 downloads: None,
                 rules: Some(vec![serde_json::json!({"action":"disallow"})]),
+                clientreq: None,
             }]),
             main_class: None,
             minecraft_arguments: None,

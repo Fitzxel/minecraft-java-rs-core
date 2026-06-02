@@ -113,7 +113,7 @@ pub async fn check_bundle(
                                 .unwrap_or_default(),
                             size,
                             r#type: Some(kind.into()),
-                            sha1: Some(sha1.clone()),
+                            sha1: if sha1.is_empty() { None } else { Some(sha1.clone()) },
                         }))
                     } else {
                         Ok(None)

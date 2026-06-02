@@ -247,6 +247,7 @@ mod tests {
                 }),
             }),
             rules: None,
+            clientreq: None,
         };
         let url = resolve_lib_url(&lib, "a/b/1.0", "b-1.0.jar");
         assert_eq!(url, "https://direct.example.com/b-1.0.jar");
@@ -259,6 +260,7 @@ mod tests {
             url: Some("https://maven.fabricmc.net/".into()),
             downloads: None,
             rules: None,
+            clientreq: None,
         };
         let url = resolve_lib_url(&lib, "a/b/1.0", "b-1.0.jar");
         assert_eq!(url, "https://maven.fabricmc.net/a/b/1.0/b-1.0.jar");
@@ -271,6 +273,7 @@ mod tests {
             url: None,
             downloads: None,
             rules: None,
+            clientreq: None,
         };
         let url = resolve_lib_url(&lib, "a/b/1.0", "b-1.0.jar");
         assert!(url.contains("repo1.maven.org"));
