@@ -280,6 +280,7 @@ fn launcher_constructs_and_save_dir_is_correct() {
         mcp: None,
         intel_enabled_mac: false,
         bypass_offline: false,
+        skip_bundle_check: false,
     };
 
     let launcher = Launcher::new(options);
@@ -324,6 +325,7 @@ async fn get_version_json_real_network_resolves_latest_release() {
         mcp: None,
         intel_enabled_mac: false,
         bypass_offline: false,
+        skip_bundle_check: false,
     };
 
     let client = reqwest::Client::builder()
@@ -387,6 +389,7 @@ async fn download_game_end_to_end() {
         mcp: None,
         intel_enabled_mac: false,
         bypass_offline: false,
+        skip_bundle_check: false,
     };
 
     let (tx, mut rx) = mpsc::channel(256);

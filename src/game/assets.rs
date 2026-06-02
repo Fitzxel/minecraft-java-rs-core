@@ -169,6 +169,7 @@ mod tests {
             mcp: None,
             intel_enabled_mac: false,
             bypass_offline: false,
+            skip_bundle_check: false,
         }
     }
 

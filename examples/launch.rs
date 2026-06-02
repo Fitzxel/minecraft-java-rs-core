@@ -56,6 +56,7 @@ struct Args {
     loader_build: String,
     only_download: bool,
     verify: bool,
+    skip_bundle_check: bool,
     auto_close: Option<u64>,
 }
 
@@ -99,6 +100,7 @@ impl Args {
             loader_build: flag_val(&argv, "--loader-build").unwrap_or_else(|| "latest".into()),
             only_download: argv.iter().any(|a| a == "--only-download"),
             verify: argv.iter().any(|a| a == "--verify"),
+            skip_bundle_check: argv.iter().any(|a| a == "--skip-bundle-check"),
             auto_close: flag_val(&argv, "--auto-close")
                 .and_then(|s| s.parse::<u64>().ok()),
         }
@@ -125,6 +127,7 @@ OPTIONS:
                               latest | recommended | <exact-version>
                                                          [default: latest]
   --only-download           Download game files, don't launch
+  --skip-bundle-check       Skip integrity check if gameData.json exists (fast re-launch)
   --verify                  Re-verify SHA-1 of all files after download
   --auto-close <SECS>       Kill Minecraft after N seconds
   -h, --help                Print this message
@@ -141,7 +144,8 @@ EXAMPLES:
 
 // ── Event printer ─────────────────────────────────────────────────────────────
 
-async fn print_events(mut rx: mpsc::Receiver<LaunchEvent>) {
+async fn print_events(mut rx: mpsc::Receiver<LaunchEvent>) -> Vec<String> {
+    let mut logs: Vec<String> = Vec::new();
     while let Some(event) = rx.recv().await {
         match event {
             LaunchEvent::Progress { downloaded, total, kind } => {
@@ -178,6 +182,7 @@ async fn print_events(mut rx: mpsc::Receiver<LaunchEvent>) {
             }
             LaunchEvent::Data(line) => {
                 println!("[MC]: {line}");
+                logs.push(line);
             }
             LaunchEvent::Error(msg) => {
                 eprintln!("\n[error]: {msg}");
@@ -188,6 +193,7 @@ async fn print_events(mut rx: mpsc::Receiver<LaunchEvent>) {
             LaunchEvent::Estimated(_) => {}
         }
     }
+    logs
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -243,6 +249,7 @@ async fn main() {
         mcp: None,
         intel_enabled_mac: false,
         bypass_offline: true,
+        skip_bundle_check: args.skip_bundle_check,
     };
 
     // ── Banner ────────────────────────────────────────────────────────────────
@@ -315,5 +322,11 @@ async fn main() {
     let _ = close_tx.send(LaunchEvent::Close(code)).await;
     drop(close_tx);
 
-    printer.await.ok();
+    let logs = printer.await.unwrap_or_default();
+
+    if args.skip_bundle_check && Launcher::is_corrupt_crash(code, &logs) {
+        eprintln!();
+        eprintln!("[!] Minecraft crashed and the cause is likely a corrupt installation.");
+        eprintln!("[!] Re-launch without --skip-bundle-check to force a full file integrity check.");
+    }
 }

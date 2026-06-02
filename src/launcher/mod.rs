@@ -82,6 +82,19 @@ impl Launcher {
             return Ok(());
         }
 
+        // ── Cache fast-path (skip_bundle_check) ──────────────────────────────
+        // "Skip if possible" hint: load from cache and return early when the
+        // caller trusts the existing installation.  If the cache is absent,
+        // fall through to the full download path without error.
+        if options.skip_bundle_check {
+            if let Ok(cached) = load_game_data(&options.save_dir()).await {
+                self.game_data = Some(cached);
+                let _ = event_tx.send(LaunchEvent::GameDownloadFinished).await;
+                return Ok(());
+            }
+            // Cache absent → continue with normal download.
+        }
+
         // ── Shared HTTP client ────────────────────────────────────────────────
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(options.timeout_secs))
@@ -446,6 +459,39 @@ impl Launcher {
         self.download_game(event_tx.clone()).await?;
         self.launch(event_tx).await
     }
+
+    /// Heuristically detect whether a game crash was caused by a corrupt or
+    /// incomplete installation.
+    ///
+    /// Returns `true` when `exit_code` is non-zero **and** at least one log
+    /// line matches a known corrupt-installation pattern. The caller can use
+    /// this as a signal to force a full re-check by calling `download_game()`
+    /// with `skip_bundle_check: false` on the next attempt.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let code = child.wait().await?.code().unwrap_or(-1);
+    /// let lines: Vec<String> = /* collected LaunchEvent::Data lines */;
+    /// if Launcher::is_corrupt_crash(code, &lines) {
+    ///     // Re-run download_game with skip_bundle_check: false
+    /// }
+    /// ```
+    pub fn is_corrupt_crash(exit_code: i32, logs: &[String]) -> bool {
+        if exit_code == 0 {
+            return false;
+        }
+        const PATTERNS: &[&str] = &[
+            "Unable to access jarfile",
+            "NoClassDefFoundError",
+            "UnsatisfiedLinkError",
+            "FileNotFoundException",
+            "ClassNotFoundException",
+            "Error: Could not find or load main class",
+            "ZipException",
+            "Error opening zip file",
+        ];
+        logs.iter().any(|line| PATTERNS.iter().any(|pat| line.contains(pat)))
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -485,6 +531,7 @@ mod tests {
             mcp: None,
             intel_enabled_mac: false,
             bypass_offline: false,
+            skip_bundle_check: false,
         }
     }
 
@@ -589,5 +636,44 @@ mod tests {
         let loader_main_class: Option<String> = None;
         let main_class = loader_main_class.as_deref().unwrap_or(&vanilla).to_owned();
         assert_eq!(main_class, "net.minecraft.client.main.Main");
+    }
+
+    // ── is_corrupt_crash ─────────────────────────────────────────────────────
+
+    #[test]
+    fn corrupt_crash_zero_exit_always_false() {
+        let logs = vec!["NoClassDefFoundError: net/minecraft/Foo".into()];
+        assert!(!Launcher::is_corrupt_crash(0, &logs));
+    }
+
+    #[test]
+    fn corrupt_crash_nonzero_no_pattern_false() {
+        let logs = vec!["Exception in thread \"main\" java.lang.RuntimeException".into()];
+        assert!(!Launcher::is_corrupt_crash(1, &logs));
+    }
+
+    #[test]
+    fn corrupt_crash_empty_logs_false() {
+        assert!(!Launcher::is_corrupt_crash(1, &[]));
+    }
+
+    #[test]
+    fn corrupt_crash_all_patterns_detected() {
+        let cases = [
+            "Unable to access jarfile foo.jar",
+            "java.lang.NoClassDefFoundError: Foo",
+            "java.lang.UnsatisfiedLinkError: /lib/foo.so",
+            "java.io.FileNotFoundException: /mc/lib.jar (No such file)",
+            "java.lang.ClassNotFoundException: net.minecraft.Main",
+            "Error: Could not find or load main class Main",
+            "java.util.zip.ZipException: invalid LOC header",
+            "Error opening zip file or JAR manifest missing",
+        ];
+        for case in &cases {
+            assert!(
+                Launcher::is_corrupt_crash(1, &[case.to_string()]),
+                "pattern not detected: {case}"
+            );
+        }
     }
 }

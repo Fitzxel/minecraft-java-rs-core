@@ -492,8 +492,9 @@ LaunchOptions {
     // Other
     timeout_secs: 30,
     download_concurrency: 10,
-    bypass_offline: false,   // set true for offline/cracked play
-    verify: false,           // re-verify SHA-1 after every download
+    bypass_offline: false,      // set true for offline/cracked play
+    verify: false,              // re-verify SHA-1 after every download
+    skip_bundle_check: false,   // set true to skip integrity check when gameData.json exists
     ..Default::default()
 }
 ```
@@ -542,6 +543,58 @@ Or across separate sessions (reads persisted cache from disk automatically):
 let mut launcher = Launcher::new(options);
 // launcher.game_data() is None here, but launch() loads from disk cache
 let mut child = launcher.launch(tx).await?;  // errors with GameDataNotReady if no cache
+```
+
+### Fast re-launch with corrupt install detection
+
+`skip_bundle_check: true` makes `download_game` return immediately by loading the
+existing `gameData.json` from disk, skipping all network calls and SHA-1 checks.
+If the cache is absent it falls through to the normal download path silently.
+
+After the process exits, call `Launcher::is_corrupt_crash` with the exit code and
+the collected `LaunchEvent::Data` log lines. It returns `true` when the exit code
+is non-zero **and** the logs contain a known corrupt-install pattern
+(`NoClassDefFoundError`, `Unable to access jarfile`, `ZipException`, etc.).
+Re-launch with `skip_bundle_check: false` to trigger a full re-verification.
+
+```rust
+use minecraft_java_rs_core::launcher::{LaunchEvent, Launcher};
+use tokio::sync::mpsc;
+
+// Collect all Data lines while printing them.
+let (tx, mut rx) = mpsc::channel::<LaunchEvent>(512);
+let log_task = tokio::spawn(async move {
+    let mut logs: Vec<String> = Vec::new();
+    while let Some(event) = rx.recv().await {
+        if let LaunchEvent::Data(line) = &event {
+            println!("[MC] {line}");
+            logs.push(line.clone());
+        }
+    }
+    logs
+});
+
+// Fast launch — trust existing gameData.json.
+let options_fast = LaunchOptions { skip_bundle_check: true, ..options.clone() };
+let mut launcher = Launcher::new(options_fast);
+launcher.download_game(tx.clone()).await?;
+let mut child = launcher.launch(tx.clone()).await?;
+let code = child.wait().await?.code().unwrap_or(-1);
+drop(tx); // close channel so log_task can finish
+let logs = log_task.await.unwrap_or_default();
+
+if Launcher::is_corrupt_crash(code, &logs) {
+    eprintln!("[!] Minecraft crashed and the cause is likely a corrupt installation.");
+    eprintln!("[!] Re-launching with a full integrity check...");
+
+    let (tx2, mut rx2) = mpsc::channel::<LaunchEvent>(512);
+    tokio::spawn(async move { while rx2.recv().await.is_some() {} }); // drain
+    let options_full = LaunchOptions { skip_bundle_check: false, ..options };
+    let mut launcher2 = Launcher::new(options_full);
+    launcher2.download_game(tx2.clone()).await?;
+    let mut child2 = launcher2.launch(tx2).await?;
+    child2.wait().await.ok();
+}
 ```
 
 ### Error: GameDataNotReady

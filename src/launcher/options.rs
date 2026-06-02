@@ -80,6 +80,13 @@ pub struct LaunchOptions {
     /// multiplayer works without a valid session (default: false).
     #[serde(default)]
     pub bypass_offline: bool,
+
+    /// When `true` and `gameData.json` already exists on disk, skip the
+    /// bundle integrity check and load directly from cache (fast launch).
+    /// Falls through to the normal download path when the cache is absent.
+    /// Default: `false` (always verify — current behaviour preserved).
+    #[serde(default)]
+    pub skip_bundle_check: bool,
 }
 
 impl LaunchOptions {
@@ -295,6 +302,7 @@ mod tests {
             mcp: None,
             intel_enabled_mac: false,
             bypass_offline: false,
+            skip_bundle_check: false,
         }
     }
 }

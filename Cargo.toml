@@ -1,6 +1,6 @@
 [package]
 name = "minecraft-java-rs-core"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 description = "Core library for launching Minecraft Java Edition"
 repository = "https://github.com/fitzxel/minecraft-java-rs-core"
