@@ -384,12 +384,34 @@ impl Launcher {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        // On Linux, force GLFW 3.4+ to use X11 via XWayland (if available) to
-        // avoid residual [0x1000C] Wayland errors that crash MC's GLFW init check.
+        // On Linux, force GLFW 3.4+ to use X11 via XWayland to avoid the
+        // [0x1000C] "Wayland: does not provide window position" error that
+        // Forge treats as fatal in its strict GLX._initGlfw error callback.
+        //
+        // DISPLAY may not be exported on pure Wayland sessions (e.g. GNOME on
+        // Fedora with on-demand XWayland) even when XWayland is available, so
+        // we fall back to probing the X11 socket directly.
+        //
+        // Removing WAYLAND_DISPLAY alone is not enough: libwayland's
+        // wl_display_connect(NULL) falls back to "wayland-0" via
+        // XDG_RUNTIME_DIR even when WAYLAND_DISPLAY is absent. Setting
+        // WAYLAND_SOCKET to a non-numeric value causes wl_display_connect to
+        // return NULL immediately (before the fallback path), so GLFW's Wayland
+        // backend fails and it falls through to X11.
         #[cfg(target_os = "linux")]
-        if std::env::var_os("DISPLAY").is_some() {
-            cmd.env_remove("WAYLAND_DISPLAY");
-            cmd.env("GLFW_PLATFORM", "x11");
+        {
+            let display = std::env::var_os("DISPLAY").or_else(|| {
+                (0..10u8).find_map(|n| {
+                    let sock = format!("/tmp/.X11-unix/X{n}");
+                    std::path::Path::new(&sock).exists().then(|| format!(":{n}").into())
+                })
+            });
+            if let Some(disp) = display {
+                cmd.env("DISPLAY", disp);
+                cmd.env_remove("WAYLAND_DISPLAY");
+                cmd.env("GLFW_PLATFORM", "x11");
+                cmd.env("WAYLAND_SOCKET", "invalid");
+            }
         }
 
         // LWJGL 2 (old Minecraft, pre-1.13) runs `xrandr` at startup via

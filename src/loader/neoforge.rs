@@ -412,11 +412,17 @@ fn resolve_library_entry(
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn make_short_prefix(mc_version: &str) -> String {
-    // "1.20.4" → "20.4."
     let parts: Vec<&str> = mc_version.splitn(3, '.').collect();
+    let major = parts.first().copied().unwrap_or("1");
     let minor = parts.get(1).copied().unwrap_or("0");
     let patch = parts.get(2).copied().unwrap_or("0");
-    format!("{minor}.{patch}.")
+    if major == "1" {
+        // Old Minecraft versioning: "1.20.4" → NeoForge "20.4."
+        format!("{minor}.{patch}.")
+    } else {
+        // New Minecraft versioning: "26.1.2" → NeoForge "26.1."
+        format!("{major}.{minor}.")
+    }
 }
 
 fn resolve_neo_build(build: &str, versions: &[String]) -> Result<String, LoaderError> {
@@ -456,6 +462,9 @@ mod tests {
         assert_eq!(make_short_prefix("1.20.4"), "20.4.");
         assert_eq!(make_short_prefix("1.21.0"), "21.0.");
         assert_eq!(make_short_prefix("1.21"), "21.0.");
+        // New Minecraft versioning (post-1.x era)
+        assert_eq!(make_short_prefix("26.1.2"), "26.1.");
+        assert_eq!(make_short_prefix("26.2.0"), "26.2.");
     }
 
     #[test]
