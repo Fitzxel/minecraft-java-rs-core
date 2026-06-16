@@ -86,8 +86,29 @@ impl Launcher {
         // "Skip if possible" hint: load from cache and return early when the
         // caller trusts the existing installation.  If the cache is absent,
         // fall through to the full download path without error.
+        //
+        // Java is the one thing we never skip: without the runtime the process
+        // can't even spawn (start() fails with os error 2), so `is_corrupt_crash`
+        // would never get to see the crash logs produced by any missing game
+        // files. We therefore always ensure Java is present here, while still
+        // skipping the (expensive) bundle integrity check for everything else.
         if options.skip_bundle_check {
-            if let Ok(cached) = load_game_data(&options.save_dir()).await {
+            if let Ok(mut cached) = load_game_data(&options.save_dir()).await {
+                let java_present =
+                    std::path::Path::new(&cached.minecraft_java.path).exists();
+                if !java_present {
+                    let client = reqwest::Client::builder()
+                        .timeout(Duration::from_secs(options.timeout_secs))
+                        .build()
+                        .map_err(LaunchError::Http)?;
+                    let java_result =
+                        get_java_files(options, &cached.minecraft_json, &client, &event_tx).await?;
+                    cached.minecraft_java = JavaInfo {
+                        files: java_result.files,
+                        path: java_result.java_path,
+                    };
+                    save_game_data(&options.save_dir(), &cached).await?;
+                }
                 self.game_data = Some(cached);
                 let _ = event_tx.send(LaunchEvent::GameDownloadFinished).await;
                 return Ok(());
@@ -502,15 +523,23 @@ impl Launcher {
         if exit_code == 0 {
             return false;
         }
+        // Match only on JVM exception class names, which the runtime prints
+        // verbatim regardless of its locale. Localized prose messages (e.g.
+        // "Error: Could not find or load main class", "Unable to access
+        // jarfile", "Error opening zip file") are translated on non-English
+        // JVMs and must not be relied on — the corresponding exception is
+        // always present alongside them and is locale-independent:
+        //   missing main class / jar  → ClassNotFoundException / NoClassDefFoundError
+        //   missing native library    → UnsatisfiedLinkError
+        //   missing file              → FileNotFoundException / NoSuchFileException
+        //   corrupt archive           → ZipException
         const PATTERNS: &[&str] = &[
-            "Unable to access jarfile",
             "NoClassDefFoundError",
+            "ClassNotFoundException",
             "UnsatisfiedLinkError",
             "FileNotFoundException",
-            "ClassNotFoundException",
-            "Error: Could not find or load main class",
+            "NoSuchFileException",
             "ZipException",
-            "Error opening zip file",
         ];
         logs.iter().any(|line| PATTERNS.iter().any(|pat| line.contains(pat)))
     }
@@ -682,14 +711,12 @@ mod tests {
     #[test]
     fn corrupt_crash_all_patterns_detected() {
         let cases = [
-            "Unable to access jarfile foo.jar",
             "java.lang.NoClassDefFoundError: Foo",
+            "java.lang.ClassNotFoundException: net.minecraft.Main",
             "java.lang.UnsatisfiedLinkError: /lib/foo.so",
             "java.io.FileNotFoundException: /mc/lib.jar (No such file)",
-            "java.lang.ClassNotFoundException: net.minecraft.Main",
-            "Error: Could not find or load main class Main",
+            "java.nio.file.NoSuchFileException: /mc/versions/1.20.4/1.20.4.jar",
             "java.util.zip.ZipException: invalid LOC header",
-            "Error opening zip file or JAR manifest missing",
         ];
         for case in &cases {
             assert!(
@@ -697,5 +724,16 @@ mod tests {
                 "pattern not detected: {case}"
             );
         }
+    }
+
+    #[test]
+    fn corrupt_crash_detected_on_localized_main_class_error() {
+        // A non-English JVM translates the prose line but the cause exception
+        // (ClassNotFoundException) is locale-independent and must still match.
+        let logs = vec![
+            "Error: no se ha encontrado o cargado la clase principal net.minecraft.client.main.Main".into(),
+            "Causado por: java.lang.ClassNotFoundException: net.minecraft.client.main.Main".into(),
+        ];
+        assert!(Launcher::is_corrupt_crash(1, &logs));
     }
 }
