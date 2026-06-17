@@ -57,6 +57,7 @@ struct Args {
     only_download: bool,
     verify: bool,
     skip_bundle_check: bool,
+    force_ipv4: bool,
     auto_close: Option<u64>,
 }
 
@@ -70,9 +71,7 @@ impl Args {
         }
 
         fn flag_val(argv: &[String], flag: &str) -> Option<String> {
-            argv.windows(2)
-                .find(|w| w[0] == flag)
-                .map(|w| w[1].clone())
+            argv.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
         }
 
         let loader_type = flag_val(&argv, "--loader-type").and_then(|s| match s.as_str() {
@@ -101,8 +100,8 @@ impl Args {
             only_download: argv.iter().any(|a| a == "--only-download"),
             verify: argv.iter().any(|a| a == "--verify"),
             skip_bundle_check: argv.iter().any(|a| a == "--skip-bundle-check"),
-            auto_close: flag_val(&argv, "--auto-close")
-                .and_then(|s| s.parse::<u64>().ok()),
+            force_ipv4: argv.iter().any(|a| a == "--force-ipv4"),
+            auto_close: flag_val(&argv, "--auto-close").and_then(|s| s.parse::<u64>().ok()),
         }
     }
 }
@@ -128,6 +127,7 @@ OPTIONS:
                                                          [default: latest]
   --only-download           Download game files, don't launch
   --skip-bundle-check       Skip integrity check if gameData.json exists (fast re-launch)
+  --force-ipv4              Force IPv4 for downloads (fixes broken-IPv6 connection errors)
   --verify                  Re-verify SHA-1 of all files after download
   --auto-close <SECS>       Kill Minecraft after N seconds
   -h, --help                Print this message
@@ -148,7 +148,11 @@ async fn print_events(mut rx: mpsc::Receiver<LaunchEvent>) -> Vec<String> {
     let mut logs: Vec<String> = Vec::new();
     while let Some(event) = rx.recv().await {
         match event {
-            LaunchEvent::Progress { downloaded, total, kind } => {
+            LaunchEvent::Progress {
+                downloaded,
+                total,
+                kind,
+            } => {
                 let pct = if total > 0 {
                     (downloaded as f64 / total as f64 * 100.0) as u32
                 } else {
@@ -157,7 +161,11 @@ async fn print_events(mut rx: mpsc::Receiver<LaunchEvent>) -> Vec<String> {
                 print!("\r[{kind}]: {downloaded}/{total} ({pct}%)   ");
                 let _ = std::io::stdout().flush();
             }
-            LaunchEvent::Check { current, total, kind } => {
+            LaunchEvent::Check {
+                current,
+                total,
+                kind,
+            } => {
                 print!("\r[check/{kind}]: {current}/{total}   ");
                 let _ = std::io::stdout().flush();
             }
@@ -250,6 +258,7 @@ async fn main() {
         intel_enabled_mac: false,
         bypass_offline: true,
         skip_bundle_check: args.skip_bundle_check,
+        force_ipv4: args.force_ipv4,
     };
 
     // ── Banner ────────────────────────────────────────────────────────────────
@@ -327,6 +336,8 @@ async fn main() {
     if args.skip_bundle_check && Launcher::is_corrupt_crash(code, &logs) {
         eprintln!();
         eprintln!("[!] Minecraft crashed and the cause is likely a corrupt installation.");
-        eprintln!("[!] Re-launch without --skip-bundle-check to force a full file integrity check.");
+        eprintln!(
+            "[!] Re-launch without --skip-bundle-check to force a full file integrity check."
+        );
     }
 }

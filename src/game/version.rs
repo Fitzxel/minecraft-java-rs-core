@@ -3,8 +3,7 @@ use crate::launcher::options::LaunchOptions;
 use crate::models::minecraft::{MinecraftVersionJson, MojangVersionManifest};
 use crate::net::http::fetch_json;
 
-const MANIFEST_URL: &str =
-    "https://launchermeta.mojang.com/mc/game/version_manifest_v2.json";
+const MANIFEST_URL: &str = "https://launchermeta.mojang.com/mc/game/version_manifest_v2.json";
 
 /// Fetch and return the `MinecraftVersionJson` for the version requested in
 /// `options`.
@@ -72,8 +71,7 @@ fn resolve_alias(version: &str, manifest: &MojangVersionManifest) -> String {
 /// Uses `std::env::consts` so that a cross-compiled binary running on ARM
 /// still detects its actual execution environment.
 fn is_linux_arm() -> bool {
-    std::env::consts::OS == "linux"
-        && matches!(std::env::consts::ARCH, "aarch64" | "arm")
+    std::env::consts::OS == "linux" && matches!(std::env::consts::ARCH, "aarch64" | "arm")
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -89,10 +87,7 @@ mod tests {
                 release: release.to_string(),
                 snapshot: snapshot.to_string(),
             },
-            versions: vec![
-                make_entry("1.20.4"),
-                make_entry("24w14a"),
-            ],
+            versions: vec![make_entry("1.20.4"), make_entry("24w14a")],
         }
     }
 
@@ -197,6 +192,7 @@ mod tests {
             intel_enabled_mac: false,
             bypass_offline: false,
             skip_bundle_check: false,
+            force_ipv4: false,
         }
     }
 
@@ -241,7 +237,10 @@ mod tests {
 
         assert_eq!(result.id, "1.20.4");
         assert_eq!(result.version_type, "release");
-        assert_eq!(result.main_class.as_deref(), Some("net.minecraft.client.main.Main"));
+        assert_eq!(
+            result.main_class.as_deref(),
+            Some("net.minecraft.client.main.Main")
+        );
         assert!(result.libraries.is_empty());
     }
 

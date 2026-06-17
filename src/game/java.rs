@@ -6,9 +6,7 @@ use tokio::sync::mpsc::Sender;
 use crate::error::LaunchError;
 use crate::launcher::events::LaunchEvent;
 use crate::launcher::options::LaunchOptions;
-use crate::models::java::{
-    AdoptiumRelease, JavaFileItem, JavaManifestData, JavaVersionManifest,
-};
+use crate::models::java::{AdoptiumRelease, JavaFileItem, JavaManifestData, JavaVersionManifest};
 use crate::models::minecraft::MinecraftVersionJson;
 use crate::net::downloader::{DownloadItem, Downloader};
 use crate::net::http::{fetch_json, fetch_text};
@@ -66,8 +64,15 @@ pub async fn get_java_files(
         });
     }
 
-    if let Some(result) =
-        try_mojang(options, &component, &platform, &runtime_root, client, event_tx).await?
+    if let Some(result) = try_mojang(
+        options,
+        &component,
+        &platform,
+        &runtime_root,
+        client,
+        event_tx,
+    )
+    .await?
     {
         return Ok(result);
     }
@@ -101,7 +106,10 @@ pub fn mojang_platform_key(intel_enabled_mac: bool) -> String {
     .to_string()
 }
 
-pub fn java_component(options: &LaunchOptions, version_json: &MinecraftVersionJson) -> (String, u32) {
+pub fn java_component(
+    options: &LaunchOptions,
+    version_json: &MinecraftVersionJson,
+) -> (String, u32) {
     if let Some(ver) = &options.java.version {
         let major = ver.parse::<u32>().unwrap_or(8);
         return (format!("jre-{major}"), major);
@@ -240,8 +248,14 @@ async fn try_mojang(
         });
     }
 
-    let downloader = Downloader::new(options.timeout_secs, options.download_concurrency);
-    downloader.download_multiple(items, event_tx.clone()).await?;
+    let downloader = Downloader::new(
+        options.timeout_secs,
+        options.clamped_concurrency(),
+        options.force_ipv4,
+    );
+    downloader
+        .download_multiple(items, event_tx.clone())
+        .await?;
 
     #[cfg(unix)]
     for (rel_path, entry) in &manifest.files {
@@ -258,7 +272,9 @@ async fn try_mojang(
     // Find the java binary by scanning manifest entries — some Mojang runtimes
     // on macOS use a bundle layout (e.g. jre.bundle/Contents/Home/bin/java)
     // rather than the flat bin/java expected by java_bin_path.
-    let java_bin = manifest.files.iter()
+    let java_bin = manifest
+        .files
+        .iter()
         .filter_map(|(rel_path, entry)| {
             if entry.executable != Some(true) {
                 return None;
@@ -329,8 +345,10 @@ async fn get_from_adoptium(
         sha1: None,
     };
 
-    let downloader = Downloader::new(options.timeout_secs, 1);
-    downloader.download_multiple(vec![item], event_tx.clone()).await?;
+    let downloader = Downloader::new(options.timeout_secs, 1, options.force_ipv4);
+    downloader
+        .download_multiple(vec![item], event_tx.clone())
+        .await?;
 
     if is_windows {
         extract_zip_to(archive_path.clone(), runtime_root).await?;
@@ -368,13 +386,12 @@ async fn extract_zip_to(archive: PathBuf, dest: &Path) -> Result<(), LaunchError
     let dest = dest.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<(), LaunchError> {
         let file = std::fs::File::open(&archive)?;
-        let mut zip = zip::ZipArchive::new(file).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-        })?;
+        let mut zip = zip::ZipArchive::new(file)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         for i in 0..zip.len() {
-            let mut entry = zip.by_index(i).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-            })?;
+            let mut entry = zip
+                .by_index(i)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
             if entry.is_dir() {
                 continue;
             }
@@ -390,7 +407,12 @@ async fn extract_zip_to(archive: PathBuf, dest: &Path) -> Result<(), LaunchError
         Ok(())
     })
     .await
-    .map_err(|e| LaunchError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))??;
+    .map_err(|e| {
+        LaunchError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            e.to_string(),
+        ))
+    })??;
     Ok(())
 }
 
@@ -448,6 +470,7 @@ mod tests {
             intel_enabled_mac: false,
             bypass_offline: false,
             skip_bundle_check: false,
+            force_ipv4: false,
         }
     }
 
@@ -497,8 +520,10 @@ mod tests {
         // Must be exactly runtime_root/bin/java — no extra component segment.
         assert!(path_str.ends_with("java") || path_str.ends_with("javaw.exe"));
         assert!(path_str.contains("/bin/"));
-        assert!(!path_str[root.to_str().unwrap().len()..].contains("jre-legacy"),
-            "component name must not appear after runtime_root: {path_str}");
+        assert!(
+            !path_str[root.to_str().unwrap().len()..].contains("jre-legacy"),
+            "component name must not appear after runtime_root: {path_str}"
+        );
     }
 
     #[test]
@@ -547,7 +572,9 @@ mod tests {
         let runtime_root = dir.path().join("runtime").join(&comp).join(&platform);
         let bin_dir = runtime_root.join("bin");
         tokio::fs::create_dir_all(&bin_dir).await.unwrap();
-        tokio::fs::write(bin_dir.join("java"), b"#!/bin/sh\nexec java").await.unwrap();
+        tokio::fs::write(bin_dir.join("java"), b"#!/bin/sh\nexec java")
+            .await
+            .unwrap();
 
         let client = reqwest::Client::new();
         let (tx, _rx) = mpsc::channel(16);

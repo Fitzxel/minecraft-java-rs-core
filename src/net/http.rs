@@ -71,10 +71,7 @@ pub async fn fetch_json<T: DeserializeOwned>(
 ///
 /// Retries up to `MAX_RETRIES` times on network errors or 5xx/429 responses,
 /// with exponential backoff starting at `INITIAL_BACKOFF_MS`.
-pub async fn fetch_text(
-    client: &reqwest::Client,
-    url: &str,
-) -> Result<String, String> {
+pub async fn fetch_text(client: &reqwest::Client, url: &str) -> Result<String, String> {
     let mut last_err = String::new();
     let mut backoff = INITIAL_BACKOFF_MS;
 

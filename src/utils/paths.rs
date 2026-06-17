@@ -97,17 +97,15 @@ mod tests {
 
     #[test]
     fn with_native_string() {
-        let r =
-            get_path_libraries("net.java.dev.jna:jna:5.10.0", Some("-natives-linux"), None)
-                .unwrap();
+        let r = get_path_libraries("net.java.dev.jna:jna:5.10.0", Some("-natives-linux"), None)
+            .unwrap();
         assert_eq!(r.path, "net/java/dev/jna/jna/5.10.0");
         assert_eq!(r.name, "jna-5.10.0-natives-linux.jar");
     }
 
     #[test]
     fn with_classifier() {
-        let r =
-            get_path_libraries("some.group:artifact:1.0:natives-win", None, None).unwrap();
+        let r = get_path_libraries("some.group:artifact:1.0:natives-win", None, None).unwrap();
         assert_eq!(r.name, "artifact-1.0-natives-win.jar");
     }
 

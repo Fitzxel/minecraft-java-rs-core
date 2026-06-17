@@ -10,7 +10,9 @@ use crate::error::LoaderError;
 use crate::launcher::events::LaunchEvent;
 use crate::launcher::options::LaunchOptions;
 use crate::loader::forge_patcher::{ForgePatcher, PatchConfig};
-use crate::models::loader::{ForgeProfile, ForgeVersionSection, InstallerInfo, LoaderLibrary, LoaderType};
+use crate::models::loader::{
+    ForgeProfile, ForgeVersionSection, InstallerInfo, LoaderLibrary, LoaderType,
+};
 use crate::models::minecraft::AssetItem;
 use crate::net::downloader::{DownloadItem, Downloader};
 use crate::utils::archive::{get_file_from_archive, ArchiveQueryResult};
@@ -24,8 +26,7 @@ const PROMOTIONS_URL: &str =
     "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json";
 const MAVEN_BASE: &str = "https://maven.minecraftforge.net/net/minecraftforge/forge";
 
-static FALLBACK_META: &[u8] =
-    include_bytes!("../../assets/forge/maven-metadata.json");
+static FALLBACK_META: &[u8] = include_bytes!("../../assets/forge/maven-metadata.json");
 
 #[derive(Deserialize)]
 struct Promotions {
@@ -55,7 +56,16 @@ impl ForgeMC {
         build: &str,
         client: &reqwest::Client,
         event_tx: &Sender<LaunchEvent>,
-    ) -> Result<(String, Option<String>, Vec<AssetItem>, Vec<String>, Vec<String>), LoaderError> {
+    ) -> Result<
+        (
+            String,
+            Option<String>,
+            Vec<AssetItem>,
+            Vec<String>,
+            Vec<String>,
+        ),
+        LoaderError,
+    > {
         let loader_base = options.loader_dir("forge");
         tokio::fs::create_dir_all(&loader_base).await?;
 
@@ -108,7 +118,13 @@ impl ForgeMC {
         let extra_jvm_args = extract_jvm_args(&loader_base, &version_id, &version_json);
         let main_class = version_json.main_class;
 
-        Ok((version_id, main_class, libraries, extra_game_args, extra_jvm_args))
+        Ok((
+            version_id,
+            main_class,
+            libraries,
+            extra_game_args,
+            extra_jvm_args,
+        ))
     }
 
     /// Download the Forge installer JAR for the given Minecraft version and build.
@@ -120,11 +136,10 @@ impl ForgeMC {
         client: &reqwest::Client,
         event_tx: &Sender<LaunchEvent>,
     ) -> Result<InstallerInfo, LoaderError> {
-        let all_versions: HashMap<String, Vec<String>> =
-            match client.get(META_URL).send().await {
-                Ok(r) if r.status().is_success() => r.json().await?,
-                _ => serde_json::from_slice(FALLBACK_META)?,
-            };
+        let all_versions: HashMap<String, Vec<String>> = match client.get(META_URL).send().await {
+            Ok(r) if r.status().is_success() => r.json().await?,
+            _ => serde_json::from_slice(FALLBACK_META)?,
+        };
 
         let versions = all_versions.get(mc_version).ok_or_else(|| {
             LoaderError::VersionNotFound(format!("Forge doesn't support Minecraft {mc_version}"))
@@ -140,9 +155,7 @@ impl ForgeMC {
         }
 
         let installer_name = format!("forge-{forge_build}-installer.jar");
-        let installer_folder = options
-            .loader_dir("forge")
-            .join("installer");
+        let installer_folder = options.loader_dir("forge").join("installer");
         let installer_path = installer_folder.join(&installer_name);
 
         if !installer_path.exists() {
@@ -156,11 +169,16 @@ impl ForgeMC {
                 r#type: Some("forge".into()),
                 sha1: None,
             };
-            let downloader = Downloader::new(options.timeout_secs, 1);
+            let downloader = Downloader::new(options.timeout_secs, 1, options.force_ipv4);
             downloader
                 .download_multiple(vec![item], event_tx.clone())
                 .await
-                .map_err(|e| LoaderError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+                .map_err(|e| {
+                    LoaderError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e.to_string(),
+                    ))
+                })?;
         }
 
         Ok(InstallerInfo {
@@ -343,17 +361,25 @@ fn extract_game_args(version: &ForgeVersionSection) -> Vec<String> {
 /// `${library_directory}` is resolved to `loader_base/libraries` (the Forge-local
 /// library path, not the vanilla MC path). `${classpath_separator}` and
 /// `${version_name}` are also substituted so the strings are ready to use as-is.
-fn extract_jvm_args(loader_base: &Path, version_id: &str, version: &ForgeVersionSection) -> Vec<String> {
+fn extract_jvm_args(
+    loader_base: &Path,
+    version_id: &str,
+    version: &ForgeVersionSection,
+) -> Vec<String> {
     let lib_dir = loader_base.join("libraries").to_string_lossy().into_owned();
-    let sep = if cfg!(target_os = "windows") { ";" } else { ":" };
+    let sep = if cfg!(target_os = "windows") {
+        ";"
+    } else {
+        ":"
+    };
     let mut args = Vec::new();
     if let Some(forge_args) = &version.arguments {
         for entry in &forge_args.jvm {
             if let Some(s) = entry.as_str() {
                 args.push(
                     s.replace("${library_directory}", &lib_dir)
-                     .replace("${classpath_separator}", sep)
-                     .replace("${version_name}", version_id),
+                        .replace("${classpath_separator}", sep)
+                        .replace("${version_name}", version_id),
                 );
             }
         }
@@ -376,16 +402,18 @@ fn build_library_assets(loader_base: &Path, version: &ForgeVersionSection) -> Ve
         }
 
         let (path, sha1, size, url) = resolve_library_entry(loader_base, lib);
-        items.push(AssetItem::Asset { path, sha1, size, url });
+        items.push(AssetItem::Asset {
+            path,
+            sha1,
+            size,
+            url,
+        });
     }
 
     items
 }
 
-fn resolve_library_entry(
-    loader_base: &Path,
-    lib: &LoaderLibrary,
-) -> (String, String, u64, String) {
+fn resolve_library_entry(loader_base: &Path, lib: &LoaderLibrary) -> (String, String, u64, String) {
     let libs_dir = loader_base.join("libraries");
 
     let artifact = lib.downloads.as_ref().and_then(|d| d.artifact.as_ref());
@@ -410,9 +438,10 @@ fn resolve_library_entry(
         .map(|a| a.url.clone())
         .filter(|u| !u.is_empty())
         .or_else(|| {
-            lib.url.as_ref().filter(|u| !u.is_empty()).map(|base| {
-                format!("{}/{}", base.trim_end_matches('/'), &rel_path)
-            })
+            lib.url
+                .as_ref()
+                .filter(|u| !u.is_empty())
+                .map(|base| format!("{}/{}", base.trim_end_matches('/'), &rel_path))
         })
         .or_else(|| {
             if !rel_path.is_empty() {
@@ -460,10 +489,9 @@ async fn resolve_forge_build(
                     }
                 }
             }
-            versions
-                .last()
-                .cloned()
-                .ok_or_else(|| LoaderError::VersionNotFound(format!("No Forge builds for {mc_version}")))
+            versions.last().cloned().ok_or_else(|| {
+                LoaderError::VersionNotFound(format!("No Forge builds for {mc_version}"))
+            })
         }
         "recommended" => {
             if let Ok(promos) = client.get(PROMOTIONS_URL).send().await {
@@ -477,10 +505,9 @@ async fn resolve_forge_build(
                     }
                 }
             }
-            versions
-                .last()
-                .cloned()
-                .ok_or_else(|| LoaderError::VersionNotFound(format!("No Forge builds for {mc_version}")))
+            versions.last().cloned().ok_or_else(|| {
+                LoaderError::VersionNotFound(format!("No Forge builds for {mc_version}"))
+            })
         }
         specific => Ok(specific.to_owned()),
     }
@@ -554,7 +581,14 @@ async fn try_patcher_install_inner(
     if !has_processors {
         // Old-format (pre-1.13): versionInfo is inline in install_profile.json.
         if profile.version_info.is_some() {
-            install_old_forge_legacy(installer_path, loader_base, version_json_path, &profile, event_tx).await?;
+            install_old_forge_legacy(
+                installer_path,
+                loader_base,
+                version_json_path,
+                &profile,
+                event_tx,
+            )
+            .await?;
             return Ok(true);
         }
         return Ok(false);
@@ -573,13 +607,22 @@ async fn try_patcher_install_inner(
     download_profile_libraries(&profile, &libs_dir, options, event_tx).await?;
 
     // 6. Extract data files embedded in the installer (BINPATCH, etc.).
-    extract_data_files(installer_path, &profile, &libs_dir, &loader_type, neo_forge_old).await?;
+    extract_data_files(
+        installer_path,
+        &profile,
+        &libs_dir,
+        &loader_type,
+        neo_forge_old,
+    )
+    .await?;
 
     // 7. Skip patching if all processor outputs already exist on disk.
     let patcher = ForgePatcher::new(loader_base.to_path_buf(), loader_type);
     if patcher.check(&profile) {
         let _ = event_tx
-            .send(LaunchEvent::Patch("[patcher] Already patched, skipping".into()))
+            .send(LaunchEvent::Patch(
+                "[patcher] Already patched, skipping".into(),
+            ))
             .await;
         return Ok(true);
     }
@@ -591,7 +634,9 @@ async fn try_patcher_install_inner(
         minecraft_json: mc_json,
         game_path,
     };
-    patcher.patch(&profile, &config, neo_forge_old, event_tx).await?;
+    patcher
+        .patch(&profile, &config, neo_forge_old, event_tx)
+        .await?;
     Ok(true)
 }
 
@@ -644,12 +689,19 @@ async fn install_old_forge_legacy(
         tokio::fs::create_dir_all(parent).await?;
     }
     tokio::fs::write(version_json_path, serde_json::to_vec_pretty(version_info)?).await?;
-    let _ = event_tx.send(LaunchEvent::Patch("[patcher] Old-format Forge: wrote version JSON".into())).await;
+    let _ = event_tx
+        .send(LaunchEvent::Patch(
+            "[patcher] Old-format Forge: wrote version JSON".into(),
+        ))
+        .await;
 
     if let Some(install) = &profile.install {
         if let (Some(file_in_zip), Some(maven_coord)) = (&install.file_path, &install.path) {
             if let Ok(lib_info) = get_path_libraries(maven_coord, None, None) {
-                let dest = loader_base.join("libraries").join(&lib_info.path).join(&lib_info.name);
+                let dest = loader_base
+                    .join("libraries")
+                    .join(&lib_info.path)
+                    .join(&lib_info.name);
                 if !dest.exists() {
                     let result = get_file_from_archive(
                         PathBuf::from(installer_path),
@@ -666,7 +718,10 @@ async fn install_old_forge_legacy(
                         }
                         tokio::fs::write(&dest, bytes).await?;
                         let _ = event_tx
-                            .send(LaunchEvent::Patch(format!("[patcher] Old-format Forge: extracted {}", lib_info.name)))
+                            .send(LaunchEvent::Patch(format!(
+                                "[patcher] Old-format Forge: extracted {}",
+                                lib_info.name
+                            )))
                             .await;
                     }
                 }
@@ -710,14 +765,13 @@ async fn extract_version_json(installer_path: &str, dest_path: &Path) -> Result<
 async fn extract_maven_entries(installer_path: &str, libs_dir: &Path) -> Result<(), LoaderError> {
     let installer = PathBuf::from(installer_path);
 
-    let names =
-        match get_file_from_archive(installer.clone(), None, Some("maven/".into()), false)
-            .await
-            .map_err(|e| LoaderError::Archive(e.to_string()))?
-        {
-            ArchiveQueryResult::Names(n) => n,
-            _ => return Ok(()),
-        };
+    let names = match get_file_from_archive(installer.clone(), None, Some("maven/".into()), false)
+        .await
+        .map_err(|e| LoaderError::Archive(e.to_string()))?
+    {
+        ArchiveQueryResult::Names(n) => n,
+        _ => return Ok(()),
+    };
 
     for name in names {
         let rel = match name.strip_prefix("maven/") {
@@ -730,14 +784,13 @@ async fn extract_maven_entries(installer_path: &str, libs_dir: &Path) -> Result<
             continue;
         }
 
-        let bytes =
-            match get_file_from_archive(installer.clone(), Some(name), None, false)
-                .await
-                .map_err(|e| LoaderError::Archive(e.to_string()))?
-            {
-                ArchiveQueryResult::FileData(b) => b,
-                _ => continue,
-            };
+        let bytes = match get_file_from_archive(installer.clone(), Some(name), None, false)
+            .await
+            .map_err(|e| LoaderError::Archive(e.to_string()))?
+        {
+            ArchiveQueryResult::FileData(b) => b,
+            _ => continue,
+        };
 
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -808,12 +861,19 @@ async fn download_profile_libraries(
     }
 
     if !items.is_empty() {
-        let downloader = Downloader::new(options.timeout_secs, options.download_concurrency);
+        let downloader = Downloader::new(
+            options.timeout_secs,
+            options.clamped_concurrency(),
+            options.force_ipv4,
+        );
         downloader
             .download_multiple(items, event_tx.clone())
             .await
             .map_err(|e| {
-                LoaderError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                LoaderError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                ))
             })?;
     }
 
@@ -925,8 +985,7 @@ mod tests {
 
     #[test]
     fn fallback_metadata_contains_versions() {
-        let parsed: HashMap<String, Vec<String>> =
-            serde_json::from_slice(FALLBACK_META).unwrap();
+        let parsed: HashMap<String, Vec<String>> = serde_json::from_slice(FALLBACK_META).unwrap();
         assert!(!parsed.is_empty());
     }
 
@@ -946,7 +1005,9 @@ mod tests {
                     artifact: Some(crate::models::loader::LoaderArtifact {
                         sha1: Some("abc".into()),
                         size: Some(123),
-                        path: Some("cpw/mods/bootstraplauncher/1.1.2/bootstraplauncher-1.1.2.jar".into()),
+                        path: Some(
+                            "cpw/mods/bootstraplauncher/1.1.2/bootstraplauncher-1.1.2.jar".into(),
+                        ),
                         url: "https://example.com/x.jar".into(),
                     }),
                 }),

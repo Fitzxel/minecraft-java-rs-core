@@ -87,6 +87,15 @@ pub struct LaunchOptions {
     /// Default: `false` (always verify — current behaviour preserved).
     #[serde(default)]
     pub skip_bundle_check: bool,
+
+    /// Force all HTTP traffic over IPv4, ignoring DNS AAAA (IPv6) records.
+    ///
+    /// Enable when downloads fail with connection errors ("error sending
+    /// request") on networks whose IPv6 route is broken even though IPv4 works
+    /// — a frequent cause of failures that vanish under a VPN or in a browser
+    /// (which does Happy Eyeballs; reqwest does not). Default: `false`.
+    #[serde(default)]
+    pub force_ipv4: bool,
 }
 
 impl LaunchOptions {
@@ -109,9 +118,12 @@ impl LaunchOptions {
         }
     }
 
-    /// `download_concurrency` clamped to the valid range 1–30.
+    /// `download_concurrency` clamped to the valid range 1–64.
+    ///
+    /// The upper bound matches the ceiling in [`adaptive_concurrency`], which
+    /// further reduces the effective value based on available CPU cores.
     pub fn clamped_concurrency(&self) -> u32 {
-        self.download_concurrency.clamp(1, 30)
+        self.download_concurrency.clamp(1, 64)
     }
 
     /// `verify_concurrency` clamped to the valid range 1–16.
@@ -217,13 +229,27 @@ pub struct LoaderInnerConfig {
 // ── Defaults (free functions required by serde's `default = "..."`) ─────────
 
 mod defaults {
-    pub fn timeout_secs() -> u64 { 10 }
-    pub fn download_concurrency() -> u32 { 5 }
-    pub fn verify_concurrency() -> u32 { 4 }
-    pub fn memory_min() -> String { "1G".into() }
-    pub fn memory_max() -> String { "2G".into() }
-    pub fn java_image_type() -> String { "jre".into() }
-    pub fn loader_build() -> String { "latest".into() }
+    pub fn timeout_secs() -> u64 {
+        10
+    }
+    pub fn download_concurrency() -> u32 {
+        5
+    }
+    pub fn verify_concurrency() -> u32 {
+        4
+    }
+    pub fn memory_min() -> String {
+        "1G".into()
+    }
+    pub fn memory_max() -> String {
+        "2G".into()
+    }
+    pub fn java_image_type() -> String {
+        "jre".into()
+    }
+    pub fn loader_build() -> String {
+        "latest".into()
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -250,7 +276,7 @@ mod tests {
         opts.download_concurrency = 0;
         assert_eq!(opts.clamped_concurrency(), 1);
         opts.download_concurrency = 99;
-        assert_eq!(opts.clamped_concurrency(), 30);
+        assert_eq!(opts.clamped_concurrency(), 64);
         opts.download_concurrency = 5;
         assert_eq!(opts.clamped_concurrency(), 5);
     }
@@ -303,6 +329,7 @@ mod tests {
             intel_enabled_mac: false,
             bypass_offline: false,
             skip_bundle_check: false,
+            force_ipv4: false,
         }
     }
 }

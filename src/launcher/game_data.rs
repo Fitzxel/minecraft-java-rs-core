@@ -4,7 +4,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::LaunchError,
-    models::{java::JavaFileItem, loader::LoaderType, minecraft::{AssetItem, MinecraftVersionJson}},
+    models::{
+        java::JavaFileItem,
+        loader::LoaderType,
+        minecraft::{AssetItem, MinecraftVersionJson},
+    },
 };
 
 // ── GameData ──────────────────────────────────────────────────────────────────
@@ -78,7 +82,10 @@ mod tests {
         GameData {
             minecraft_version: "1.20.4".into(),
             minecraft_loader: None,
-            minecraft_java: JavaInfo { files: vec![], path: "/usr/bin/java".into() },
+            minecraft_java: JavaInfo {
+                files: vec![],
+                path: "/usr/bin/java".into(),
+            },
             loader_libraries: vec![],
             loader_main_class: None,
             loader_version_id: None,

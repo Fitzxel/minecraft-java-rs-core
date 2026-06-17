@@ -56,7 +56,10 @@ pub enum LoaderError {
     ProfileNotFound,
 
     #[error("forge processor '{processor}' failed with exit code {code:?}")]
-    ProcessorFailed { processor: String, code: Option<i32> },
+    ProcessorFailed {
+        processor: String,
+        code: Option<i32>,
+    },
 
     #[error("loader API error: {0}")]
     ApiError(String),
@@ -91,6 +94,13 @@ pub enum DownloadError {
 
     #[error("request timed out")]
     Timeout,
+
+    /// The request never reached the server (DNS failure, unreachable route,
+    /// connection reset/timeout). Carries a human description of the
+    /// transport-level cause instead of reqwest's opaque "error sending
+    /// request for url" message.
+    #[error("could not reach {url} ({detail})")]
+    Connection { url: String, detail: String },
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

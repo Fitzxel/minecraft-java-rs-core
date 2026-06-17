@@ -6,12 +6,9 @@
 ///   cargo test -- --include-ignored
 use minecraft_java_rs_core::{
     game::bundle::{check_bundle, check_files, get_total_size},
-    loader::{create_loader, ModLoader},
     loader::types::{LoaderInstallInput, LoaderResult},
-    models::{
-        loader::LoaderType,
-        minecraft::AssetItem,
-    },
+    loader::{create_loader, ModLoader},
+    models::{loader::LoaderType, minecraft::AssetItem},
     utils::paths::get_path_libraries,
 };
 use tokio::sync::mpsc;
@@ -41,21 +38,33 @@ fn path_libraries_with_classifier() {
 #[test]
 fn path_libraries_at_extension_overrides_jar() {
     let info = get_path_libraries("com.example:mylib:1.0.0@zip", None, None).unwrap();
-    assert!(info.name.ends_with(".zip"), "expected .zip, got {}", info.name);
+    assert!(
+        info.name.ends_with(".zip"),
+        "expected .zip, got {}",
+        info.name
+    );
 }
 
 #[test]
 fn path_libraries_force_ext_overrides_default_jar() {
     // force_ext replaces the default .jar when there is no @ext in the coordinate.
     let info = get_path_libraries("com.example:mylib:1.0.0", None, Some(".lzma")).unwrap();
-    assert!(info.name.ends_with(".lzma"), "expected .lzma, got {}", info.name);
+    assert!(
+        info.name.ends_with(".lzma"),
+        "expected .lzma, got {}",
+        info.name
+    );
 }
 
 #[test]
 fn path_libraries_at_ext_takes_precedence_over_force_ext() {
     // When the coordinate includes @zip, the @ext wins; force_ext is not applied.
     let info = get_path_libraries("com.example:mylib:1.0.0@zip", None, Some("lzma")).unwrap();
-    assert!(info.name.ends_with(".zip"), "expected @zip to win, got {}", info.name);
+    assert!(
+        info.name.ends_with(".zip"),
+        "expected @zip to win, got {}",
+        info.name
+    );
 }
 
 #[test]
@@ -133,7 +142,12 @@ async fn check_bundle_writes_cfile_and_queues_missing_assets() {
     );
 
     // Only the missing asset should be queued.
-    assert_eq!(pending.len(), 1, "expected 1 pending download, got {:?}", pending.len());
+    assert_eq!(
+        pending.len(),
+        1,
+        "expected 1 pending download, got {:?}",
+        pending.len()
+    );
     assert!(
         pending[0].url.contains("da39a3ee"),
         "wrong URL in pending: {}",
@@ -150,7 +164,11 @@ async fn check_bundle_writes_cfile_and_queues_missing_assets() {
     drain_channel(&mut rx2);
 
     // existing.jar is correct; missing.bin has wrong SHA-1.
-    assert_eq!(corrupted.len(), 1, "expected 1 corrupted file, got {corrupted:?}");
+    assert_eq!(
+        corrupted.len(),
+        1,
+        "expected 1 corrupted file, got {corrupted:?}"
+    );
     assert!(
         corrupted[0].contains("missing.bin"),
         "unexpected corrupted path: {}",
@@ -197,8 +215,7 @@ fn dispatcher_creates_distinct_box_for_every_loader_type() {
     ];
 
     // Each call must succeed and produce a Box<dyn ModLoader>.
-    let loaders: Vec<Box<dyn ModLoader>> =
-        types.into_iter().map(create_loader).collect();
+    let loaders: Vec<Box<dyn ModLoader>> = types.into_iter().map(create_loader).collect();
 
     assert_eq!(loaders.len(), 5);
 }
@@ -221,14 +238,12 @@ fn loader_install_input_roundtrip() {
 #[test]
 fn loader_result_carries_expected_fields() {
     let result = LoaderResult {
-        libraries: vec![
-            AssetItem::Asset {
-                path: "/mc/libraries/fabric-loader.jar".into(),
-                sha1: "abc".into(),
-                size: 1024,
-                url: "https://maven.fabricmc.net/fabric-loader.jar".into(),
-            },
-        ],
+        libraries: vec![AssetItem::Asset {
+            path: "/mc/libraries/fabric-loader.jar".into(),
+            sha1: "abc".into(),
+            size: 1024,
+            url: "https://maven.fabricmc.net/fabric-loader.jar".into(),
+        }],
         main_class: Some("net.fabricmc.loader.impl.launch.knot.KnotClient".into()),
         loader_version: "fabric-loader-0.15.6-1.20.4".into(),
         loader_type: LoaderType::Fabric,
@@ -246,10 +261,10 @@ fn loader_result_carries_expected_fields() {
 
 #[test]
 fn launcher_constructs_and_save_dir_is_correct() {
-    use minecraft_java_rs_core::launcher::Launcher;
     use minecraft_java_rs_core::launcher::options::{
         JavaOptions, LoaderConfig, MemoryConfig, ScreenConfig,
     };
+    use minecraft_java_rs_core::launcher::Launcher;
     use minecraft_java_rs_core::models::minecraft::Authenticator;
     use std::path::PathBuf;
 
@@ -281,6 +296,7 @@ fn launcher_constructs_and_save_dir_is_correct() {
         intel_enabled_mac: false,
         bypass_offline: false,
         skip_bundle_check: false,
+        force_ipv4: false,
     };
 
     let launcher = Launcher::new(options);
@@ -326,6 +342,7 @@ async fn get_version_json_real_network_resolves_latest_release() {
         intel_enabled_mac: false,
         bypass_offline: false,
         skip_bundle_check: false,
+        force_ipv4: false,
     };
 
     let client = reqwest::Client::builder()
@@ -333,10 +350,9 @@ async fn get_version_json_real_network_resolves_latest_release() {
         .build()
         .unwrap();
 
-    let version_json =
-        minecraft_java_rs_core::game::version::get_version_json(&options, &client)
-            .await
-            .unwrap();
+    let version_json = minecraft_java_rs_core::game::version::get_version_json(&options, &client)
+        .await
+        .unwrap();
 
     // The resolved version should be a non-empty string like "1.20.4".
     assert!(!version_json.id.is_empty());
@@ -353,10 +369,10 @@ async fn get_version_json_real_network_resolves_latest_release() {
 #[tokio::test]
 #[ignore = "requires internet, downloads real game files (~100 MB+)"]
 async fn download_game_end_to_end() {
-    use minecraft_java_rs_core::launcher::Launcher;
     use minecraft_java_rs_core::launcher::options::{
         JavaOptions, LoaderConfig, MemoryConfig, ScreenConfig,
     };
+    use minecraft_java_rs_core::launcher::Launcher;
     use minecraft_java_rs_core::models::minecraft::Authenticator;
     use tempfile::TempDir;
 
@@ -390,6 +406,7 @@ async fn download_game_end_to_end() {
         intel_enabled_mac: false,
         bypass_offline: false,
         skip_bundle_check: false,
+        force_ipv4: false,
     };
 
     let (tx, mut rx) = mpsc::channel(256);

@@ -138,7 +138,11 @@ mod tests {
     #[test]
     fn os_specific_rule_only_matches_that_os() {
         // A disallow rule for a different OS should not affect the current platform.
-        let other_os = if mojang_os() == "linux" { "windows" } else { "linux" };
+        let other_os = if mojang_os() == "linux" {
+            "windows"
+        } else {
+            "linux"
+        };
         let rules = vec![allow(None), disallow(Some(other_os))];
         // allow(all) set should_skip=false, then disallow(other) doesn't match → still false
         assert!(!skip_library(&rules));

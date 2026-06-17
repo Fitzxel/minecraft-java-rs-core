@@ -57,8 +57,7 @@ fn query_zip_sync(
     include_dirs: bool,
 ) -> Result<ArchiveQueryResult, LaunchError> {
     let f = std::fs::File::open(path)?;
-    let mut archive =
-        zip::ZipArchive::new(f).map_err(|e| LaunchError::Archive(e.to_string()))?;
+    let mut archive = zip::ZipArchive::new(f).map_err(|e| LaunchError::Archive(e.to_string()))?;
 
     if let Some(name) = file {
         return match archive.by_name(name) {
@@ -141,7 +140,10 @@ fn extract_tar_gz_sync(
     // Follow symlinks inside the archive (needed for some JDK tarballs).
     archive.set_preserve_permissions(true);
 
-    for entry in archive.entries().map_err(|e| LaunchError::Archive(e.to_string()))? {
+    for entry in archive
+        .entries()
+        .map_err(|e| LaunchError::Archive(e.to_string()))?
+    {
         let mut entry = entry.map_err(|e| LaunchError::Archive(e.to_string()))?;
 
         let raw_path = entry
@@ -242,10 +244,9 @@ mod tests {
     #[tokio::test]
     async fn list_all_files_no_dirs() {
         let zip_file = make_test_zip();
-        let result =
-            get_file_from_archive(zip_file.path().to_path_buf(), None, None, false)
-                .await
-                .unwrap();
+        let result = get_file_from_archive(zip_file.path().to_path_buf(), None, None, false)
+            .await
+            .unwrap();
 
         match result {
             ArchiveQueryResult::Names(names) => {
@@ -284,15 +285,16 @@ mod tests {
     #[tokio::test]
     async fn list_all_entries_include_dirs() {
         let zip_file = make_test_zip();
-        let result =
-            get_file_from_archive(zip_file.path().to_path_buf(), None, None, true)
-                .await
-                .unwrap();
+        let result = get_file_from_archive(zip_file.path().to_path_buf(), None, None, true)
+            .await
+            .unwrap();
 
         match result {
             ArchiveQueryResult::Entries(entries) => {
                 assert!(entries.iter().any(|e| e.is_dir && e.name == "META-INF/"));
-                assert!(entries.iter().any(|e| !e.is_dir && e.name == "data/hello.txt"));
+                assert!(entries
+                    .iter()
+                    .any(|e| !e.is_dir && e.name == "data/hello.txt"));
             }
             other => panic!("unexpected result: {other:?}"),
         }

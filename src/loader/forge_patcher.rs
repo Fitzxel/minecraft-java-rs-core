@@ -57,7 +57,10 @@ pub struct ForgePatcher {
 
 impl ForgePatcher {
     pub fn new(loader_base: PathBuf, loader_type: LoaderType) -> Self {
-        Self { loader_base, loader_type }
+        Self {
+            loader_base,
+            loader_type,
+        }
     }
 
     /// Check whether patching has already been applied.
@@ -100,7 +103,11 @@ impl ForgePatcher {
         for file in &files {
             let coord = file.trim_matches(|c| c == '[' || c == ']');
             if let Ok(info) = get_path_libraries(coord, None, None) {
-                let path = self.loader_base.join("libraries").join(&info.path).join(&info.name);
+                let path = self
+                    .loader_base
+                    .join("libraries")
+                    .join(&info.path)
+                    .join(&info.name);
                 if !path.exists() {
                     return false;
                 }
@@ -318,7 +325,11 @@ impl ForgePatcher {
         }
 
         // Fixed placeholder substitutions (no quotes needed — Rust doesn't use shell).
-        let libs_dir = self.loader_base.join("libraries").to_string_lossy().into_owned();
+        let libs_dir = self
+            .loader_base
+            .join("libraries")
+            .to_string_lossy()
+            .into_owned();
         let root_dir = config.game_path.to_string_lossy().into_owned();
 
         arg.replace("{SIDE}", "client")
@@ -408,7 +419,11 @@ async fn read_jar_manifest(jar_path: &Path) -> Result<Option<String>, LoaderErro
 
 /// Classpath separator: `;` on Windows, `:` everywhere else.
 fn cp_separator() -> &'static str {
-    if cfg!(target_os = "windows") { ";" } else { ":" }
+    if cfg!(target_os = "windows") {
+        ";"
+    } else {
+        ":"
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -498,10 +513,16 @@ mod tests {
                 server: None,
             },
         );
-        let profile = ForgeProfile { data: Some(data), ..Default::default() };
+        let profile = ForgeProfile {
+            data: Some(data),
+            ..Default::default()
+        };
         let config = make_config(&game);
         let result = p.set_argument("{MAPPINGS}", &profile, &config, true);
-        assert_eq!(result, "[net.minecraftforge:forge:1.20.1-47.4.20:client-mappings@txt]");
+        assert_eq!(
+            result,
+            "[net.minecraftforge:forge:1.20.1-47.4.20:client-mappings@txt]"
+        );
     }
 
     #[test]
@@ -536,7 +557,10 @@ mod tests {
     #[test]
     fn check_returns_true_when_no_processors() {
         let p = make_patcher();
-        let profile = ForgeProfile { processors: None, ..Default::default() };
+        let profile = ForgeProfile {
+            processors: None,
+            ..Default::default()
+        };
         assert!(p.check(&profile));
     }
 
@@ -612,7 +636,8 @@ mod tests {
             let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
             let opts = SimpleFileOptions::default();
             w.start_file("META-INF/MANIFEST.MF", opts).unwrap();
-            w.write_all(b"Manifest-Version: 1.0\r\nMain-Class: com.example.Main\r\n").unwrap();
+            w.write_all(b"Manifest-Version: 1.0\r\nMain-Class: com.example.Main\r\n")
+                .unwrap();
             let data = w.finish().unwrap();
             tmp.write_all(data.get_ref()).unwrap();
         }
@@ -631,7 +656,8 @@ mod tests {
             let opts = SimpleFileOptions::default();
             w.start_file("META-INF/MANIFEST.MF", opts).unwrap();
             // LF only (the bug in TS) — Rust handles fine with str::lines().
-            w.write_all(b"Manifest-Version: 1.0\nMain-Class: com.example.Main\n").unwrap();
+            w.write_all(b"Manifest-Version: 1.0\nMain-Class: com.example.Main\n")
+                .unwrap();
             let data = w.finish().unwrap();
             tmp.write_all(data.get_ref()).unwrap();
         }

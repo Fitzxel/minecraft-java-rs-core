@@ -6,7 +6,6 @@ pub use events::LaunchEvent;
 
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::Sender;
@@ -46,7 +45,10 @@ impl Launcher {
                 options.path = abs;
             }
         }
-        Self { options, game_data: None }
+        Self {
+            options,
+            game_data: None,
+        }
     }
 
     pub fn options(&self) -> &LaunchOptions {
@@ -94,13 +96,11 @@ impl Launcher {
         // skipping the (expensive) bundle integrity check for everything else.
         if options.skip_bundle_check {
             if let Ok(mut cached) = load_game_data(&options.save_dir()).await {
-                let java_present =
-                    std::path::Path::new(&cached.minecraft_java.path).exists();
+                let java_present = std::path::Path::new(&cached.minecraft_java.path).exists();
                 if !java_present {
-                    let client = reqwest::Client::builder()
-                        .timeout(Duration::from_secs(options.timeout_secs))
-                        .build()
-                        .map_err(LaunchError::Http)?;
+                    let client =
+                        crate::net::client::build_client(options.timeout_secs, options.force_ipv4)
+                            .map_err(LaunchError::Http)?;
                     let java_result =
                         get_java_files(options, &cached.minecraft_json, &client, &event_tx).await?;
                     cached.minecraft_java = JavaInfo {
@@ -117,9 +117,7 @@ impl Launcher {
         }
 
         // ── Shared HTTP client ────────────────────────────────────────────────
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(options.timeout_secs))
-            .build()
+        let client = crate::net::client::build_client(options.timeout_secs, options.force_ipv4)
             .map_err(LaunchError::Http)?;
 
         // ── Version JSON ──────────────────────────────────────────────────────
@@ -137,16 +135,28 @@ impl Launcher {
         let java_result = get_java_files(options, &version_json, &client, &event_tx).await?;
 
         // ── Bundle integrity check & download ─────────────────────────────────
-        let pending = check_bundle(&bundle, &event_tx, options.clamped_verify_concurrency()).await?;
+        let pending =
+            check_bundle(&bundle, &event_tx, options.clamped_verify_concurrency()).await?;
         if !pending.is_empty() {
-            let downloader = Downloader::new(options.timeout_secs, options.download_concurrency);
+            let downloader = Downloader::new(
+                options.timeout_secs,
+                options.clamped_concurrency(),
+                options.force_ipv4,
+            );
             downloader
                 .download_multiple(pending, event_tx.clone())
                 .await?;
         }
 
         // ── Mod loader install ────────────────────────────────────────────────
-        let (loader_libraries, loader_main_class, loader_version_id, loader_type, loader_extra_game_args, loader_extra_jvm_args) = if options.loader.enable {
+        let (
+            loader_libraries,
+            loader_main_class,
+            loader_version_id,
+            loader_type,
+            loader_extra_game_args,
+            loader_extra_jvm_args,
+        ) = if options.loader.enable {
             if let Some(loader_type) = &options.loader.loader_type {
                 let mc_jar = options
                     .path
@@ -171,8 +181,17 @@ impl Launcher {
                 };
 
                 let loader_impl = create_loader(loader_type.clone());
-                let result = loader_impl.install(options, &input, &client, &event_tx).await?;
-                (result.libraries, result.main_class, Some(result.loader_version), Some(result.loader_type), result.extra_game_args, result.extra_jvm_args)
+                let result = loader_impl
+                    .install(options, &input, &client, &event_tx)
+                    .await?;
+                (
+                    result.libraries,
+                    result.main_class,
+                    Some(result.loader_version),
+                    Some(result.loader_type),
+                    result.extra_game_args,
+                    result.extra_jvm_args,
+                )
             } else {
                 (vec![], None, None, None, vec![], vec![])
             }
@@ -187,10 +206,18 @@ impl Launcher {
         // download them here.  When --installClient was used the files already
         // exist and check_bundle returns an empty pending list immediately.
         if !loader_libraries.is_empty() {
-            let loader_pending = check_bundle(&loader_libraries, &event_tx, options.clamped_verify_concurrency()).await?;
+            let loader_pending = check_bundle(
+                &loader_libraries,
+                &event_tx,
+                options.clamped_verify_concurrency(),
+            )
+            .await?;
             if !loader_pending.is_empty() {
-                let downloader =
-                    Downloader::new(options.timeout_secs, options.download_concurrency);
+                let downloader = Downloader::new(
+                    options.timeout_secs,
+                    options.clamped_concurrency(),
+                    options.force_ipv4,
+                );
                 downloader
                     .download_multiple(loader_pending, event_tx.clone())
                     .await?;
@@ -281,7 +308,9 @@ impl Launcher {
         // causes split-package conflicts in the Java module layer.
         // Old Forge (pre-1.17, no module path args) uses FML's class patcher which
         // needs the vanilla jar directly on the classpath — don't exclude it there.
-        let uses_module_path = game_data.loader_extra_jvm_args.iter()
+        let uses_module_path = game_data
+            .loader_extra_jvm_args
+            .iter()
             .any(|a| a == "-p" || a == "--module-path");
         let exclude_vanilla_jar = matches!(game_data.loader_type, Some(LoaderType::NeoForge))
             || (matches!(game_data.loader_type, Some(LoaderType::Forge)) && uses_module_path);
@@ -293,17 +322,21 @@ impl Launcher {
                 .join(format!("{}.jar", version_json.id))
                 .to_string_lossy()
                 .into_owned();
-            vanilla_libs.retain(|lib| !matches!(lib, AssetItem::Asset { path, .. } if path == &mc_jar));
+            vanilla_libs
+                .retain(|lib| !matches!(lib, AssetItem::Asset { path, .. } if path == &mc_jar));
         }
         bundle.extend(vanilla_libs);
 
         // Argument assembly.
-        let loader_ctx = game_data.loader_version_id.as_ref().map(|vid| LoaderContext {
-            loader_type: game_data.loader_type.as_ref(),
-            version_id: Some(vid.as_str()),
-            extra_game_args: &game_data.loader_extra_game_args,
-            extra_jvm_args: &game_data.loader_extra_jvm_args,
-        });
+        let loader_ctx = game_data
+            .loader_version_id
+            .as_ref()
+            .map(|vid| LoaderContext {
+                loader_type: game_data.loader_type.as_ref(),
+                version_id: Some(vid.as_str()),
+                extra_game_args: &game_data.loader_extra_game_args,
+                extra_jvm_args: &game_data.loader_extra_jvm_args,
+            });
         let jvm_args = get_jvm_arguments(options, version_json, &natives_path, loader_ctx.as_ref());
         let mut game_args = get_game_arguments(options, version_json, loader_ctx.as_ref());
         let (cp_args, vanilla_main_class) = get_classpath(version_json, &bundle);
@@ -353,23 +386,27 @@ impl Launcher {
         let cp_args = if module_path_jars.is_empty() {
             cp_args
         } else {
-            cp_args.into_iter().map(|arg| {
-                // The classpath string is the arg after "-cp".
-                if arg.contains(':') || arg.ends_with(".jar") {
-                    let filtered: Vec<&str> = arg.split(':')
-                        .filter(|entry| {
-                            let fname = std::path::Path::new(entry)
-                                .file_name()
-                                .map(|f| f.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                            !module_path_jars.contains(&fname)
-                        })
-                        .collect();
-                    filtered.join(":")
-                } else {
-                    arg
-                }
-            }).collect()
+            cp_args
+                .into_iter()
+                .map(|arg| {
+                    // The classpath string is the arg after "-cp".
+                    if arg.contains(':') || arg.ends_with(".jar") {
+                        let filtered: Vec<&str> = arg
+                            .split(':')
+                            .filter(|entry| {
+                                let fname = std::path::Path::new(entry)
+                                    .file_name()
+                                    .map(|f| f.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                !module_path_jars.contains(&fname)
+                            })
+                            .collect();
+                        filtered.join(":")
+                    } else {
+                        arg
+                    }
+                })
+                .collect()
         };
 
         let mut all_args: Vec<String> = Vec::new();
@@ -424,7 +461,9 @@ impl Launcher {
             let display = std::env::var_os("DISPLAY").or_else(|| {
                 (0..10u8).find_map(|n| {
                     let sock = format!("/tmp/.X11-unix/X{n}");
-                    std::path::Path::new(&sock).exists().then(|| format!(":{n}").into())
+                    std::path::Path::new(&sock)
+                        .exists()
+                        .then(|| format!(":{n}").into())
                 })
             });
             if let Some(disp) = display {
@@ -446,7 +485,10 @@ impl Launcher {
             && !crate::game::lwjgl_native::xrandr_in_path()
         {
             let stub_dir = options.path.join("cache").join("xrandr-stub");
-            if crate::game::lwjgl_native::write_xrandr_stub(&stub_dir).await.is_ok() {
+            if crate::game::lwjgl_native::write_xrandr_stub(&stub_dir)
+                .await
+                .is_ok()
+            {
                 let base_path = std::env::var("PATH").unwrap_or_default();
                 cmd.env(
                     "PATH",
@@ -455,7 +497,8 @@ impl Launcher {
             }
         }
 
-        let mut child = cmd.spawn()
+        let mut child = cmd
+            .spawn()
             .map_err(|e| LaunchError::ProcessError(e.to_string()))?;
 
         // Pipe stdout lines → LaunchEvent::Data.
@@ -541,7 +584,8 @@ impl Launcher {
             "NoSuchFileException",
             "ZipException",
         ];
-        logs.iter().any(|line| PATTERNS.iter().any(|pat| line.contains(pat)))
+        logs.iter()
+            .any(|line| PATTERNS.iter().any(|pat| line.contains(pat)))
     }
 }
 
@@ -583,6 +627,7 @@ mod tests {
             intel_enabled_mac: false,
             bypass_offline: false,
             skip_bundle_check: false,
+            force_ipv4: false,
         }
     }
 
@@ -644,7 +689,11 @@ mod tests {
     #[test]
     fn screen_args_appended_when_set() {
         use crate::launcher::options::ScreenConfig;
-        let screen = ScreenConfig { width: Some(1920), height: Some(1080), fullscreen: false };
+        let screen = ScreenConfig {
+            width: Some(1920),
+            height: Some(1080),
+            fullscreen: false,
+        };
         let mut game_args: Vec<String> = vec!["--version".into(), "1.20.4".into()];
         if let Some(w) = screen.width {
             game_args.push("--width".into());
@@ -664,7 +713,11 @@ mod tests {
     #[test]
     fn screen_fullscreen_appended_when_set() {
         use crate::launcher::options::ScreenConfig;
-        let screen = ScreenConfig { width: None, height: None, fullscreen: true };
+        let screen = ScreenConfig {
+            width: None,
+            height: None,
+            fullscreen: true,
+        };
         let mut game_args: Vec<String> = vec![];
         if screen.fullscreen {
             game_args.push("--fullscreen".into());
@@ -678,7 +731,10 @@ mod tests {
         let loader_main_class: Option<String> =
             Some("net.fabricmc.loader.impl.launch.knot.KnotClient".into());
         let main_class = loader_main_class.as_deref().unwrap_or(&vanilla).to_owned();
-        assert_eq!(main_class, "net.fabricmc.loader.impl.launch.knot.KnotClient");
+        assert_eq!(
+            main_class,
+            "net.fabricmc.loader.impl.launch.knot.KnotClient"
+        );
     }
 
     #[test]

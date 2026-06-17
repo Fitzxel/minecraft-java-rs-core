@@ -80,14 +80,17 @@ impl FabricMC {
             meta.loader
                 .first()
                 .map(|b| b.version.clone())
-                .ok_or_else(|| LoaderError::VersionNotFound(format!("No {version_name} builds available")))?
+                .ok_or_else(|| {
+                    LoaderError::VersionNotFound(format!("No {version_name} builds available"))
+                })?
         } else {
             meta.loader
                 .iter()
                 .find(|b| b.version == build)
                 .map(|b| b.version.clone())
                 .ok_or_else(|| {
-                    let available: Vec<_> = meta.loader.iter().map(|b| b.version.as_str()).collect();
+                    let available: Vec<_> =
+                        meta.loader.iter().map(|b| b.version.as_str()).collect();
                     LoaderError::VersionNotFound(format!(
                         "{version_name} build {build} not found. Available: {}",
                         available.join(", ")
@@ -184,11 +187,20 @@ impl FabricMC {
         }
 
         if !pending.is_empty() {
-            let downloader = Downloader::new(options.timeout_secs, options.download_concurrency);
+            let downloader = Downloader::new(
+                options.timeout_secs,
+                options.clamped_concurrency(),
+                options.force_ipv4,
+            );
             downloader
                 .download_multiple(pending, event_tx.clone())
                 .await
-                .map_err(|e| LoaderError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+                .map_err(|e| {
+                    LoaderError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e.to_string(),
+                    ))
+                })?;
         }
 
         Ok(items)

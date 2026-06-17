@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::error::LaunchError;
-use crate::net::http::fetch_json;
 use crate::launcher::options::LaunchOptions;
 use crate::models::minecraft::{ArtifactInfo, AssetItem, Library, MinecraftVersionJson};
+use crate::net::http::fetch_json;
 use crate::utils::paths::get_path_libraries;
 use crate::utils::platform::{mojang_os, skip_library};
 
@@ -126,11 +126,7 @@ pub async fn get_assets_others(
         }
 
         let full_path = match &options.instance {
-            Some(inst) => options
-                .path
-                .join("instances")
-                .join(inst)
-                .join(&asset.path),
+            Some(inst) => options.path.join("instances").join(inst).join(&asset.path),
             None => options.path.join(&asset.path),
         };
 
@@ -224,9 +220,19 @@ fn artifact_to_item(
     let url = artifact.url.clone();
 
     if is_native {
-        Some(AssetItem::NativeAsset { path: full_path, sha1, size, url })
+        Some(AssetItem::NativeAsset {
+            path: full_path,
+            sha1,
+            size,
+            url,
+        })
     } else {
-        Some(AssetItem::Asset { path: full_path, sha1, size, url })
+        Some(AssetItem::Asset {
+            path: full_path,
+            sha1,
+            size,
+            url,
+        })
     }
 }
 
@@ -244,7 +250,10 @@ fn resolve_regular_library(base: &Path, lib: &Library) -> Option<AssetItem> {
     // by the time we reach here the library already matched the current
     // platform. Mark it as a native so its contents are extracted to the
     // natives directory rather than placed on the classpath.
-    let is_native = lib.name.split(':').nth(3)
+    let is_native = lib
+        .name
+        .split(':')
+        .nth(3)
         .map(|c| c.starts_with("natives-"))
         .unwrap_or(false);
 
@@ -369,6 +378,7 @@ mod tests {
             intel_enabled_mac: false,
             bypass_offline: false,
             skip_bundle_check: false,
+            force_ipv4: false,
         }
     }
 
@@ -429,7 +439,9 @@ mod tests {
         });
 
         let items = get_libraries(&opts(dir.path().to_path_buf()), &vj);
-        assert!(items.iter().any(|i| matches!(i, AssetItem::Asset { path, .. } if path.ends_with("1.20.4.jar"))));
+        assert!(items
+            .iter()
+            .any(|i| matches!(i, AssetItem::Asset { path, .. } if path.ends_with("1.20.4.jar"))));
     }
 
     #[test]
@@ -437,7 +449,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let vj = bare_version();
         let items = get_libraries(&opts(dir.path().to_path_buf()), &vj);
-        assert!(items.iter().any(|i| matches!(i, AssetItem::CFile { path, .. } if path.ends_with("1.20.4.json"))));
+        assert!(items
+            .iter()
+            .any(|i| matches!(i, AssetItem::CFile { path, .. } if path.ends_with("1.20.4.json"))));
     }
 
     #[test]
@@ -451,7 +465,9 @@ mod tests {
         )];
 
         let items = get_libraries(&opts(dir.path().to_path_buf()), &vj);
-        assert!(items.iter().any(|i| matches!(i, AssetItem::Asset { url, .. } if url == "https://example.com/lib.jar")));
+        assert!(items.iter().any(
+            |i| matches!(i, AssetItem::Asset { url, .. } if url == "https://example.com/lib.jar")
+        ));
     }
 
     #[test]
@@ -506,7 +522,10 @@ mod tests {
             rules: None,
             natives: None,
             downloads: Some(LibraryDownloads {
-                artifact: Some(artifact(&jar_path, "https://libraries.minecraft.net/native.jar")),
+                artifact: Some(artifact(
+                    &jar_path,
+                    "https://libraries.minecraft.net/native.jar",
+                )),
                 classifiers: None,
             }),
             url: None,
@@ -515,7 +534,9 @@ mod tests {
 
         let items = get_libraries(&opts(dir.path().to_path_buf()), &vj);
         assert!(
-            items.iter().any(|i| matches!(i, AssetItem::NativeAsset { .. })),
+            items
+                .iter()
+                .any(|i| matches!(i, AssetItem::NativeAsset { .. })),
             "expected NativeAsset for modern natives-<os> classifier, got: {items:?}"
         );
     }

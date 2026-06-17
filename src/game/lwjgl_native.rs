@@ -15,14 +15,7 @@ use crate::models::minecraft::{Library, MinecraftVersionJson};
 
 macro_rules! lwjgl_bytes {
     ($arch:literal, $ver:literal) => {
-        include_bytes!(concat!(
-            "../../assets/LWJGL/",
-            $arch,
-            "/",
-            $ver,
-            ".json"
-        ))
-        .as_ref()
+        include_bytes!(concat!("../../assets/LWJGL/", $arch, "/", $ver, ".json")).as_ref()
     };
 }
 
@@ -30,7 +23,11 @@ macro_rules! lwjgl_bytes {
 /// combination is not bundled.
 fn arm_lwjgl_data(arch: &str, version: &str) -> Option<&'static [u8]> {
     // Mojang 2.9.x releases are all patched to 2.9.4 (matches JS behaviour).
-    let version = if version.contains("2.9") { "2.9.4" } else { version };
+    let version = if version.contains("2.9") {
+        "2.9.4"
+    } else {
+        version
+    };
 
     match (arch, version) {
         ("aarch64", "2.9.4") => Some(lwjgl_bytes!("aarch64", "2.9.4")),
@@ -62,8 +59,17 @@ pub fn process_json(version: &mut MinecraftVersionJson) -> Result<(), LaunchErro
     };
 
     // Detect LWJGL and JInput versions from the existing library list.
-    let version_jinput = find_version(&version.libraries, &["net.java.jinput:jinput-platform:", "net.java.jinput:jinput:"]);
-    let version_lwjgl = find_version(&version.libraries, &["org.lwjgl:lwjgl:", "org.lwjgl.lwjgl:lwjgl:"]);
+    let version_jinput = find_version(
+        &version.libraries,
+        &[
+            "net.java.jinput:jinput-platform:",
+            "net.java.jinput:jinput:",
+        ],
+    );
+    let version_lwjgl = find_version(
+        &version.libraries,
+        &["org.lwjgl:lwjgl:", "org.lwjgl.lwjgl:lwjgl:"],
+    );
 
     // Remove official JInput libraries (replaced by ARM equivalents).
     if version_jinput.is_some() {
@@ -126,10 +132,7 @@ pub fn uses_lwjgl2(version: &MinecraftVersionJson) -> bool {
 #[cfg(target_os = "linux")]
 pub fn xrandr_in_path() -> bool {
     std::env::var_os("PATH")
-        .map(|p| {
-            std::env::split_paths(&p)
-                .any(|dir| dir.join("xrandr").is_file())
-        })
+        .map(|p| std::env::split_paths(&p).any(|dir| dir.join("xrandr").is_file()))
         .unwrap_or(false)
 }
 
@@ -192,7 +195,10 @@ mod tests {
     #[test]
     fn find_version_returns_last_colon_segment() {
         let l = libs(&["org.lwjgl:lwjgl:3.3.1", "org.lwjgl:lwjgl-opengl:3.3.1"]);
-        assert_eq!(find_version(&l, &["org.lwjgl:lwjgl:"]), Some("3.3.1".into()));
+        assert_eq!(
+            find_version(&l, &["org.lwjgl:lwjgl:"]),
+            Some("3.3.1".into())
+        );
     }
 
     #[test]

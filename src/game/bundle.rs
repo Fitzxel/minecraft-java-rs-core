@@ -70,8 +70,18 @@ pub async fn check_bundle(
                     Ok(None)
                 }
 
-                AssetItem::Asset { ref path, ref sha1, size, ref url }
-                | AssetItem::NativeAsset { ref path, ref sha1, size, ref url } => {
+                AssetItem::Asset {
+                    ref path,
+                    ref sha1,
+                    size,
+                    ref url,
+                }
+                | AssetItem::NativeAsset {
+                    ref path,
+                    ref sha1,
+                    size,
+                    ref url,
+                } => {
                     let dest = PathBuf::from(path);
                     let needs_download = if dest.exists() {
                         if sha1.is_empty() {
@@ -113,7 +123,11 @@ pub async fn check_bundle(
                                 .unwrap_or_default(),
                             size,
                             r#type: Some(kind.into()),
-                            sha1: if sha1.is_empty() { None } else { Some(sha1.clone()) },
+                            sha1: if sha1.is_empty() {
+                                None
+                            } else {
+                                Some(sha1.clone())
+                            },
                         }))
                     } else {
                         Ok(None)
@@ -129,10 +143,12 @@ pub async fn check_bundle(
             Ok(Ok(Some(item))) => pending.push(item),
             Ok(Ok(None)) => {}
             Ok(Err(e)) => return Err(e),
-            Err(e) => return Err(LaunchError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                e.to_string(),
-            ))),
+            Err(e) => {
+                return Err(LaunchError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                )))
+            }
         }
     }
 
@@ -192,7 +208,12 @@ pub async fn check_files(
                 get_file_hash(&path_clone, HashAlgorithm::Sha1)
             })
             .await
-            .map_err(|e| LaunchError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))??;
+            .map_err(|e| {
+                LaunchError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                ))
+            })??;
 
             if actual != expected_sha1 {
                 Ok(Some(path.to_string_lossy().into_owned()))
@@ -263,10 +284,7 @@ mod tests {
     async fn check_bundle_writes_cfile() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("indexes").join("test.json");
-        let bundle = vec![cfile(
-            &path.to_string_lossy(),
-            r#"{"objects":{}}"#,
-        )];
+        let bundle = vec![cfile(&path.to_string_lossy(), r#"{"objects":{}}"#)];
         let (tx, _rx) = mpsc::channel(16);
         let pending = check_bundle(&bundle, &tx, 4).await.unwrap();
         assert!(pending.is_empty());
@@ -293,7 +311,12 @@ mod tests {
     async fn check_bundle_missing_asset_added_to_pending() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("missing.jar");
-        let bundle = vec![asset(&path.to_string_lossy(), "deadbeef", 42, "http://example.com/a.jar")];
+        let bundle = vec![asset(
+            &path.to_string_lossy(),
+            "deadbeef",
+            42,
+            "http://example.com/a.jar",
+        )];
 
         let (tx, _rx) = mpsc::channel(16);
         let pending = check_bundle(&bundle, &tx, 4).await.unwrap();
@@ -314,7 +337,12 @@ mod tests {
         hasher.update(content);
         let sha1 = format!("{:x}", hasher.finalize());
 
-        let bundle = vec![asset(&path.to_string_lossy(), &sha1, 11, "http://example.com/x")];
+        let bundle = vec![asset(
+            &path.to_string_lossy(),
+            &sha1,
+            11,
+            "http://example.com/x",
+        )];
         let (tx, _rx) = mpsc::channel(16);
         let pending = check_bundle(&bundle, &tx, 4).await.unwrap();
         assert!(pending.is_empty());
@@ -326,7 +354,12 @@ mod tests {
         let path = dir.path().join("asset.dat");
         tokio::fs::write(&path, b"stale content").await.unwrap();
 
-        let bundle = vec![asset(&path.to_string_lossy(), "0000000000000000000000000000000000000000", 13, "http://example.com/x")];
+        let bundle = vec![asset(
+            &path.to_string_lossy(),
+            "0000000000000000000000000000000000000000",
+            13,
+            "http://example.com/x",
+        )];
         let (tx, _rx) = mpsc::channel(16);
         let pending = check_bundle(&bundle, &tx, 4).await.unwrap();
         assert_eq!(pending.len(), 1);
@@ -357,7 +390,12 @@ mod tests {
         let path = dir.path().join("lib.jar");
         tokio::fs::write(&path, b"corrupted").await.unwrap();
 
-        let bundle = vec![asset(&path.to_string_lossy(), "0000000000000000000000000000000000000000", 9, "http://x")];
+        let bundle = vec![asset(
+            &path.to_string_lossy(),
+            "0000000000000000000000000000000000000000",
+            9,
+            "http://x",
+        )];
         let (tx, _rx) = mpsc::channel(16);
         let bad = check_files(&bundle, &tx, 4).await.unwrap();
         assert_eq!(bad.len(), 1);

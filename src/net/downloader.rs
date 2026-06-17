@@ -48,10 +48,8 @@ pub struct Downloader {
 }
 
 impl Downloader {
-    pub fn new(timeout_secs: u64, concurrency: u32) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(timeout_secs))
-            .build()
+    pub fn new(timeout_secs: u64, concurrency: u32, force_ipv4: bool) -> Self {
+        let client = crate::net::client::build_client(timeout_secs, force_ipv4)
             .expect("failed to build reqwest client");
         Self {
             client,
@@ -208,6 +206,22 @@ fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
 }
 
+/// Map a `reqwest::Error` to a `DownloadError`, distinguishing transport-level
+/// failures (no HTTP status — DNS, unreachable, reset, timeout) from
+/// server-side ones. Transport failures get a human-readable cause via
+/// [`describe_reqwest_error`](crate::net::client::describe_reqwest_error) so the
+/// user sees the real reason instead of "error sending request for url".
+fn classify_error(url: &str, e: reqwest::Error) -> DownloadError {
+    if e.status().is_some() {
+        DownloadError::Http(e)
+    } else {
+        DownloadError::Connection {
+            url: url.to_owned(),
+            detail: crate::net::client::describe_reqwest_error(&e),
+        }
+    }
+}
+
 /// Download `item` to disk, updating `dl_counter` with each received chunk.
 ///
 /// Uses a temporary file (`<path>.tmp`) and an atomic rename so a failed or
@@ -252,7 +266,7 @@ async fn fetch_one(
         let response = match client.get(&item.url).send().await {
             Ok(r) => r,
             Err(e) => {
-                last_err = Some(DownloadError::Http(e));
+                last_err = Some(classify_error(&item.url, e));
                 continue;
             }
         };
@@ -294,7 +308,7 @@ async fn fetch_one(
                     dl_counter.fetch_add(chunk.len() as u64, Ordering::Relaxed);
                 }
                 Err(e) => {
-                    stream_err = Some(DownloadError::Http(e));
+                    stream_err = Some(classify_error(&item.url, e));
                     break;
                 }
             }
@@ -347,7 +361,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     fn make_downloader() -> Downloader {
-        Downloader::new(5, 4)
+        Downloader::new(5, 4, false)
     }
 
     #[test]
@@ -386,20 +400,20 @@ mod tests {
             r#type: None,
             sha1: None,
         };
-        let d = Downloader::new(1, 1); // 1-second timeout
+        let d = Downloader::new(1, 1, false); // 1-second timeout
         let result = d.download_file(&item).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn check_url_unreachable_returns_false() {
-        let d = Downloader::new(1, 1);
+        let d = Downloader::new(1, 1, false);
         assert!(!d.check_url("http://127.0.0.1:1/test").await);
     }
 
     #[tokio::test]
     async fn check_mirror_all_bad_returns_none() {
-        let d = Downloader::new(1, 1);
+        let d = Downloader::new(1, 1, false);
         let result = d
             .check_mirror(&["http://127.0.0.1:1"], "/some/path.jar")
             .await;
@@ -418,7 +432,7 @@ mod tests {
             r#type: Some("test".into()),
             sha1: None,
         };
-        let d = Downloader::new(1, 1);
+        let d = Downloader::new(1, 1, false);
         let (tx, _rx) = mpsc::channel(16);
         let result = d.download_multiple(vec![item], tx).await;
         assert!(result.is_err());
@@ -437,7 +451,7 @@ mod tests {
             r#type: None,
             sha1: None,
         };
-        let d = Downloader::new(1, 1);
+        let d = Downloader::new(1, 1, false);
         let _ = d.download_file(&item).await;
 
         let tmp = {
@@ -445,6 +459,9 @@ mod tests {
             s.push(".tmp");
             PathBuf::from(s)
         };
-        assert!(!tmp.exists(), ".tmp file should be cleaned up after failure");
+        assert!(
+            !tmp.exists(),
+            ".tmp file should be cleaned up after failure"
+        );
     }
 }

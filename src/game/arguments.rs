@@ -105,7 +105,10 @@ pub fn get_jvm_arguments(
 
     // 3. Forge / NeoForge specific flags.
     if let Some(ctx) = loader {
-        if matches!(ctx.loader_type, Some(LoaderType::Forge) | Some(LoaderType::NeoForge)) {
+        if matches!(
+            ctx.loader_type,
+            Some(LoaderType::Forge) | Some(LoaderType::NeoForge)
+        ) {
             args.push("-Dfml.ignoreInvalidMinecraftCertificates=true".into());
             args.push("-Dfml.ignorePatchDiscrepancies=true".into());
         }
@@ -130,7 +133,9 @@ pub fn get_jvm_arguments(
     // 5. Native library directories.
     args.push(format!("-Djava.library.path={natives_str}"));
     args.push(format!("-Djna.tmpdir={natives_str}"));
-    args.push(format!("-Dorg.lwjgl.system.SharedLibraryExtractPath={natives_str}"));
+    args.push(format!(
+        "-Dorg.lwjgl.system.SharedLibraryExtractPath={natives_str}"
+    ));
     args.push(format!("-Dio.netty.native.workdir={natives_str}"));
 
     // 6. Modern JVM args from the version JSON.
@@ -157,7 +162,10 @@ pub fn get_jvm_arguments(
                 } else if val.is_object() {
                     if jvm_rule_passes(val) {
                         for token in extract_jvm_value(val) {
-                            if token == "-cp" || token == "--classpath" || token.contains("${classpath}") {
+                            if token == "-cp"
+                                || token == "--classpath"
+                                || token.contains("${classpath}")
+                            {
                                 continue;
                             }
                             args.push(replace_placeholders(&token, &ph));
@@ -230,7 +238,9 @@ pub fn get_classpath(
     });
     if has_slf4j2 {
         deduped.retain(|p| {
-            let name = p.file_name().map_or(String::new(), |f| f.to_string_lossy().into_owned());
+            let name = p
+                .file_name()
+                .map_or(String::new(), |f| f.to_string_lossy().into_owned());
             // Keep everything except the SLF4J 1.x binding.
             !name.contains("log4j-slf4j-impl") || name.contains("log4j-slf4j2-impl")
         });
@@ -295,9 +305,16 @@ fn build_game_placeholders<'a>(
     let game_directory = options.save_dir().to_string_lossy().into_owned();
 
     // Legacy (pre-1.7.10) assets live under resources/ instead of assets/.
-    let is_legacy = matches!(version_json.assets.as_deref(), Some("legacy") | Some("pre-1.6"));
+    let is_legacy = matches!(
+        version_json.assets.as_deref(),
+        Some("legacy") | Some("pre-1.6")
+    );
     let assets_root = if is_legacy {
-        options.path.join("resources").to_string_lossy().into_owned()
+        options
+            .path
+            .join("resources")
+            .to_string_lossy()
+            .into_owned()
     } else {
         options.path.join("assets").to_string_lossy().into_owned()
     };
@@ -333,14 +350,15 @@ fn build_jvm_placeholders<'a>(
     ph.insert("natives_directory", natives_str.to_owned());
     ph.insert("launcher_name", "minecraft-java-rs-core".into());
     ph.insert("launcher_version", env!("CARGO_PKG_VERSION").into());
-    ph.insert(
-        "classpath_separator",
-        classpath_separator().to_string(),
-    );
+    ph.insert("classpath_separator", classpath_separator().to_string());
     ph.insert("classpath", classpath.to_owned());
     ph.insert(
         "library_directory",
-        options.path.join("libraries").to_string_lossy().into_owned(),
+        options
+            .path
+            .join("libraries")
+            .to_string_lossy()
+            .into_owned(),
     );
     ph
 }
@@ -371,7 +389,10 @@ fn jvm_rule_passes(val: &serde_json::Value) -> bool {
 
     let mut result = false;
     for rule in rules {
-        let action = rule.get("action").and_then(|a| a.as_str()).unwrap_or("disallow");
+        let action = rule
+            .get("action")
+            .and_then(|a| a.as_str())
+            .unwrap_or("disallow");
         let allow = action == "allow";
 
         if let Some(os) = rule.get("os") {
@@ -511,7 +532,10 @@ mod tests {
             timeout_secs: 10,
             download_concurrency: 5,
             verify_concurrency: 4,
-            memory: MemoryConfig { min: "512M".into(), max: "4G".into() },
+            memory: MemoryConfig {
+                min: "512M".into(),
+                max: "4G".into(),
+            },
             java: JavaOptions::default(),
             loader: LoaderConfig::default(),
             screen: ScreenConfig::default(),
@@ -524,6 +548,7 @@ mod tests {
             intel_enabled_mac: false,
             bypass_offline: false,
             skip_bundle_check: false,
+            force_ipv4: false,
         }
     }
 
@@ -549,9 +574,8 @@ mod tests {
     fn legacy_game_args_split_and_replace() {
         let opts = make_opts();
         let mut vj = bare_version();
-        vj.minecraft_arguments = Some(
-            "--username ${auth_player_name} --version ${version_name}".into(),
-        );
+        vj.minecraft_arguments =
+            Some("--username ${auth_player_name} --version ${version_name}".into());
         let args = get_game_arguments(&opts, &vj, None);
         assert_eq!(args[0], "--username");
         assert_eq!(args[1], "Steve");
@@ -592,7 +616,9 @@ mod tests {
     fn user_type_is_msa_when_xbox_account_present() {
         use crate::models::minecraft::XboxAccount;
         let mut opts = make_opts();
-        opts.authenticator.xbox_account = Some(XboxAccount { xuid: "x123".into() });
+        opts.authenticator.xbox_account = Some(XboxAccount {
+            xuid: "x123".into(),
+        });
         let mut vj = bare_version();
         vj.minecraft_arguments = Some("${user_type}".into());
         let args = get_game_arguments(&opts, &vj, None);
@@ -629,7 +655,11 @@ mod tests {
         let opts = make_opts();
         let mut vj = bare_version();
         vj.minecraft_arguments = Some("--username ${auth_player_name}".into());
-        let extra = vec!["--launchTarget".into(), "fmlclient".into(), "--username".into()];
+        let extra = vec![
+            "--launchTarget".into(),
+            "fmlclient".into(),
+            "--username".into(),
+        ];
         let ctx = LoaderContext {
             loader_type: Some(&LoaderType::Forge),
             version_id: None,
@@ -700,8 +730,12 @@ mod tests {
         let natives = Path::new("/natives");
         let args = get_jvm_arguments(&opts, &bare_version(), natives, None);
         assert!(args.iter().any(|a| a.starts_with("-Djna.tmpdir=")));
-        assert!(args.iter().any(|a| a.starts_with("-Dorg.lwjgl.system.SharedLibraryExtractPath=")));
-        assert!(args.iter().any(|a| a.starts_with("-Dio.netty.native.workdir=")));
+        assert!(args
+            .iter()
+            .any(|a| a.starts_with("-Dorg.lwjgl.system.SharedLibraryExtractPath=")));
+        assert!(args
+            .iter()
+            .any(|a| a.starts_with("-Dio.netty.native.workdir=")));
     }
 
     #[test]
@@ -753,7 +787,8 @@ mod tests {
         let vj = bare_version();
         let bundle = vec![
             AssetItem::Asset {
-                path: "/mc/libraries/net/sf/jopt-simple/jopt-simple/5.0.4/jopt-simple-5.0.4.jar".into(),
+                path: "/mc/libraries/net/sf/jopt-simple/jopt-simple/5.0.4/jopt-simple-5.0.4.jar"
+                    .into(),
                 sha1: "aaa".into(),
                 size: 100,
                 url: "http://x".into(),
@@ -818,7 +853,10 @@ mod tests {
         let cp = &cp_args[1];
         let forge_pos = cp.find("forge-1.0.jar").unwrap();
         let lwjgl_pos = cp.find("lwjgl-3.3.1.jar").unwrap();
-        assert!(forge_pos < lwjgl_pos, "loader lib should come before vanilla lib");
+        assert!(
+            forge_pos < lwjgl_pos,
+            "loader lib should come before vanilla lib"
+        );
     }
 
     #[test]
@@ -840,8 +878,14 @@ mod tests {
         ];
         let (cp_args, _) = get_classpath(&vj, &bundle);
         let cp = &cp_args[1];
-        assert!(cp.contains("log4j-slf4j2-impl"), "should keep slf4j2 binding: {cp}");
-        assert!(!cp.contains("log4j-slf4j-impl-18"), "should drop slf4j1 binding: {cp}");
+        assert!(
+            cp.contains("log4j-slf4j2-impl"),
+            "should keep slf4j2 binding: {cp}"
+        );
+        assert!(
+            !cp.contains("log4j-slf4j-impl-18"),
+            "should drop slf4j1 binding: {cp}"
+        );
     }
 
     #[test]
@@ -863,8 +907,14 @@ mod tests {
         ];
         let (cp_args, _) = get_classpath(&vj, &bundle);
         let cp = &cp_args[1];
-        assert!(cp.contains("forge-26.1.2-64.0.8-universal.jar"), "universal must be kept: {cp}");
-        assert!(cp.contains("forge-26.1.2-64.0.8-client.jar"), "client must be kept: {cp}");
+        assert!(
+            cp.contains("forge-26.1.2-64.0.8-universal.jar"),
+            "universal must be kept: {cp}"
+        );
+        assert!(
+            cp.contains("forge-26.1.2-64.0.8-client.jar"),
+            "client must be kept: {cp}"
+        );
     }
 
     #[test]

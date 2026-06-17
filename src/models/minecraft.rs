@@ -201,4 +201,3 @@ pub struct Authenticator {
 pub struct XboxAccount {
     pub xuid: String,
 }
-

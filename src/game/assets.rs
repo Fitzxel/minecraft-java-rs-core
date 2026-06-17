@@ -29,8 +29,9 @@ pub async fn get_assets(
     let raw = fetch_text(client, &ai.url)
         .await
         .map_err(LaunchError::InvalidData)?;
-    let data: AssetIndexData = serde_json::from_str(&raw)
-        .map_err(|e| LaunchError::InvalidData(format!("GET {}: failed to parse asset index: {e}", &ai.url)))?;
+    let data: AssetIndexData = serde_json::from_str(&raw).map_err(|e| {
+        LaunchError::InvalidData(format!("GET {}: failed to parse asset index: {e}", &ai.url))
+    })?;
 
     let base = &options.path;
     let mut items: Vec<AssetItem> = Vec::with_capacity(data.objects.len() + 1);
@@ -96,11 +97,7 @@ pub async fn copy_assets(
     let data: AssetIndexData = serde_json::from_str(&raw)?;
 
     let legacy_dir = match &options.instance {
-        Some(inst) => options
-            .path
-            .join("instances")
-            .join(inst)
-            .join("resources"),
+        Some(inst) => options.path.join("instances").join(inst).join("resources"),
         None => options.path.join("resources"),
     };
 
@@ -140,8 +137,8 @@ mod tests {
     use tempfile::TempDir;
 
     fn opts(path: PathBuf) -> LaunchOptions {
-        use crate::models::minecraft::Authenticator;
         use crate::launcher::options::{JavaOptions, LoaderConfig, MemoryConfig, ScreenConfig};
+        use crate::models::minecraft::Authenticator;
         LaunchOptions {
             path,
             version: "1.20.4".into(),
@@ -170,6 +167,7 @@ mod tests {
             intel_enabled_mac: false,
             bypass_offline: false,
             skip_bundle_check: false,
+            force_ipv4: false,
         }
     }
 
@@ -193,9 +191,13 @@ mod tests {
     async fn get_assets_returns_empty_without_asset_index() {
         let dir = TempDir::new().unwrap();
         let client = reqwest::Client::new();
-        let result = get_assets(&opts(dir.path().to_path_buf()), &version_json_no_assets(), &client)
-            .await
-            .unwrap();
+        let result = get_assets(
+            &opts(dir.path().to_path_buf()),
+            &version_json_no_assets(),
+            &client,
+        )
+        .await
+        .unwrap();
         assert!(result.is_empty());
     }
 
@@ -203,7 +205,9 @@ mod tests {
     async fn copy_assets_noop_when_no_assets_field() {
         let dir = TempDir::new().unwrap();
         let vj = version_json_no_assets();
-        copy_assets(&opts(dir.path().to_path_buf()), &vj).await.unwrap();
+        copy_assets(&opts(dir.path().to_path_buf()), &vj)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -212,7 +216,9 @@ mod tests {
         let mut vj = version_json_no_assets();
         vj.assets = Some("legacy".into());
         // index file doesn't exist → should return Ok(()) without creating anything
-        copy_assets(&opts(dir.path().to_path_buf()), &vj).await.unwrap();
+        copy_assets(&opts(dir.path().to_path_buf()), &vj)
+            .await
+            .unwrap();
         assert!(!dir.path().join("resources").exists());
     }
 
@@ -226,7 +232,9 @@ mod tests {
         let sub = &hash[..2];
         let obj_dir = base.join("assets").join("objects").join(sub);
         tokio::fs::create_dir_all(&obj_dir).await.unwrap();
-        tokio::fs::write(obj_dir.join(hash), b"fake asset content").await.unwrap();
+        tokio::fs::write(obj_dir.join(hash), b"fake asset content")
+            .await
+            .unwrap();
 
         // Write the asset index pointing to it
         let index_json = format!(
@@ -234,15 +242,24 @@ mod tests {
         );
         let idx_dir = base.join("assets").join("indexes");
         tokio::fs::create_dir_all(&idx_dir).await.unwrap();
-        tokio::fs::write(idx_dir.join("legacy.json"), &index_json).await.unwrap();
+        tokio::fs::write(idx_dir.join("legacy.json"), &index_json)
+            .await
+            .unwrap();
 
         let mut vj = version_json_no_assets();
         vj.assets = Some("legacy".into());
 
         copy_assets(&opts(base.to_path_buf()), &vj).await.unwrap();
 
-        let copied = base.join("resources").join("sounds").join("ambient").join("cave.ogg");
-        assert!(copied.exists(), "asset should have been copied to resources/");
+        let copied = base
+            .join("resources")
+            .join("sounds")
+            .join("ambient")
+            .join("cave.ogg");
+        assert!(
+            copied.exists(),
+            "asset should have been copied to resources/"
+        );
         assert_eq!(std::fs::read(&copied).unwrap(), b"fake asset content");
     }
 
@@ -255,19 +272,24 @@ mod tests {
         let sub = &hash[..2];
         let obj_dir = base.join("assets").join("objects").join(sub);
         tokio::fs::create_dir_all(&obj_dir).await.unwrap();
-        tokio::fs::write(obj_dir.join(hash), b"new content").await.unwrap();
+        tokio::fs::write(obj_dir.join(hash), b"new content")
+            .await
+            .unwrap();
 
-        let index_json = format!(
-            r#"{{"objects": {{"file.txt": {{"hash": "{hash}", "size": 11}}}}}}"#
-        );
+        let index_json =
+            format!(r#"{{"objects": {{"file.txt": {{"hash": "{hash}", "size": 11}}}}}}"#);
         let idx_dir = base.join("assets").join("indexes");
         tokio::fs::create_dir_all(&idx_dir).await.unwrap();
-        tokio::fs::write(idx_dir.join("legacy.json"), &index_json).await.unwrap();
+        tokio::fs::write(idx_dir.join("legacy.json"), &index_json)
+            .await
+            .unwrap();
 
         // Pre-create target with different content
         let resources_dir = base.join("resources");
         tokio::fs::create_dir_all(&resources_dir).await.unwrap();
-        tokio::fs::write(resources_dir.join("file.txt"), b"original").await.unwrap();
+        tokio::fs::write(resources_dir.join("file.txt"), b"original")
+            .await
+            .unwrap();
 
         let mut vj = version_json_no_assets();
         vj.assets = Some("legacy".into());
@@ -288,14 +310,16 @@ mod tests {
         let sub = &hash[..2];
         let obj_dir = base.join("assets").join("objects").join(sub);
         tokio::fs::create_dir_all(&obj_dir).await.unwrap();
-        tokio::fs::write(obj_dir.join(hash), b"sound").await.unwrap();
+        tokio::fs::write(obj_dir.join(hash), b"sound")
+            .await
+            .unwrap();
 
-        let index_json = format!(
-            r#"{{"objects": {{"a.ogg": {{"hash": "{hash}", "size": 5}}}}}}"#
-        );
+        let index_json = format!(r#"{{"objects": {{"a.ogg": {{"hash": "{hash}", "size": 5}}}}}}"#);
         let idx_dir = base.join("assets").join("indexes");
         tokio::fs::create_dir_all(&idx_dir).await.unwrap();
-        tokio::fs::write(idx_dir.join("legacy.json"), &index_json).await.unwrap();
+        tokio::fs::write(idx_dir.join("legacy.json"), &index_json)
+            .await
+            .unwrap();
 
         let mut options = opts(base.to_path_buf());
         options.instance = Some("myworld".into());
@@ -305,7 +329,11 @@ mod tests {
 
         copy_assets(&options, &vj).await.unwrap();
 
-        let target = base.join("instances").join("myworld").join("resources").join("a.ogg");
+        let target = base
+            .join("instances")
+            .join("myworld")
+            .join("resources")
+            .join("a.ogg");
         assert!(target.exists());
     }
 }

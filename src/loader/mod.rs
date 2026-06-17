@@ -83,7 +83,8 @@ impl ModLoader for FabricMC {
             .download_libraries(options, &json, client, event_tx)
             .await?;
         save_loader_version(&options.loader_dir(loader_name), &json.id, &json).await?;
-        let extra_game_args = json.minecraft_arguments
+        let extra_game_args = json
+            .minecraft_arguments
             .as_deref()
             .map(|s| s.split_whitespace().map(str::to_owned).collect())
             .unwrap_or_default();
@@ -114,7 +115,8 @@ impl ModLoader for QuiltMC {
             .download_libraries(options, &json, client, event_tx)
             .await?;
         save_loader_version(&options.loader_dir("quilt"), &json.id, &json).await?;
-        let extra_game_args = json.minecraft_arguments
+        let extra_game_args = json
+            .minecraft_arguments
             .as_deref()
             .map(|s| s.split_whitespace().map(str::to_owned).collect())
             .unwrap_or_default();

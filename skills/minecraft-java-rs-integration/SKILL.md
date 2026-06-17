@@ -2,7 +2,7 @@
 name: minecraft-java-rs-integration
 metadata:
   author: Fitzxel
-  version: "0.1.0"
+  version: "0.3.0"
 description: >
   Guide and code generator for integrating the minecraft-java-rs-core Rust library
   into external projects. Use this skill whenever someone wants to use
@@ -495,9 +495,33 @@ LaunchOptions {
     bypass_offline: false,      // set true for offline/cracked play
     verify: false,              // re-verify SHA-1 after every download
     skip_bundle_check: false,   // set true to skip integrity check when gameData.json exists
+    force_ipv4: false,          // set true to force IPv4 (fixes broken-IPv6 download errors)
     ..Default::default()
 }
 ```
+
+### `force_ipv4` — fixing connection errors that vanish under a VPN
+
+Default `false`. When `true`, all launcher HTTP traffic (downloads **and** metadata
+fetches) is restricted to IPv4 by filtering DNS results to A records before any
+connection is attempted — AAAA (IPv6) addresses are ignored.
+
+**When to enable it.** Some networks advertise IPv6 (AAAA records) but have a broken
+IPv6 route. Browsers paper over this with Happy Eyeballs (they race IPv4 and IPv6 and
+use whichever connects first); the underlying HTTP stack here does not, so it can hang
+or fail on the dead IPv6 path. The classic symptoms:
+
+- Downloads fail with `download error: could not reach <url> (...)` — a connection
+  error with **no HTTP status** (the request never reached the server), often citing
+  a cause like *"Network is unreachable"* or *"Temporary failure in name resolution"*.
+- The **same URL opens fine in a browser**, and the download **works over a VPN**
+  (the VPN provides a working IPv6 route or forces IPv4).
+
+In that situation, set `force_ipv4: true` and the downloads succeed without a VPN.
+
+> Leave it `false` by default. Forcing IPv4 would break users on genuinely
+> **IPv6-only** networks, so enable it only as a remedy (or expose it as a toggle /
+> "having download problems?" option in your UI).
 
 ---
 

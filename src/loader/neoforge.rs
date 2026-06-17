@@ -22,10 +22,8 @@ const LEGACY_META_URL: &str =
 const NEW_META_URL: &str =
     "https://maven.neoforged.net/releases/net/neoforged/neoforge/maven-metadata.xml";
 
-const LEGACY_MAVEN: &str =
-    "https://maven.neoforged.net/releases/net/neoforged/forge";
-const NEW_MAVEN: &str =
-    "https://maven.neoforged.net/releases/net/neoforged/neoforge";
+const LEGACY_MAVEN: &str = "https://maven.neoforged.net/releases/net/neoforged/forge";
+const NEW_MAVEN: &str = "https://maven.neoforged.net/releases/net/neoforged/neoforge";
 
 // ── XML maven-metadata.xml parser ─────────────────────────────────────────────
 
@@ -64,7 +62,16 @@ impl NeoForgeMC {
         build: &str,
         client: &reqwest::Client,
         event_tx: &Sender<LaunchEvent>,
-    ) -> Result<(String, Option<String>, Vec<AssetItem>, Vec<String>, Vec<String>), LoaderError> {
+    ) -> Result<
+        (
+            String,
+            Option<String>,
+            Vec<AssetItem>,
+            Vec<String>,
+            Vec<String>,
+        ),
+        LoaderError,
+    > {
         let loader_base = options.loader_dir("neoforge");
         tokio::fs::create_dir_all(&loader_base).await?;
 
@@ -113,7 +120,13 @@ impl NeoForgeMC {
         let extra_jvm_args = extract_jvm_args(&loader_base, &version_id, &version_json);
         let main_class = version_json.main_class;
 
-        Ok((version_id, main_class, libraries, extra_game_args, extra_jvm_args))
+        Ok((
+            version_id,
+            main_class,
+            libraries,
+            extra_game_args,
+            extra_jvm_args,
+        ))
     }
 
     /// Download the NeoForge installer JAR.
@@ -127,17 +140,18 @@ impl NeoForgeMC {
     ) -> Result<InstallerInfo, LoaderError> {
         // Try legacy API first.
         let legacy = client.get(LEGACY_META_URL).send().await.ok();
-        let (legacy_versions, _old_api) = if let Some(r) = legacy.filter(|r| r.status().is_success()) {
-            let text = r.text().await.unwrap_or_default();
-            let prefix = format!("{mc_version}-");
-            let filtered: Vec<String> = parse_maven_xml_versions(&text)
-                .into_iter()
-                .filter(|v| v.starts_with(&prefix))
-                .collect();
-            (filtered, true)
-        } else {
-            (Vec::new(), true)
-        };
+        let (legacy_versions, _old_api) =
+            if let Some(r) = legacy.filter(|r| r.status().is_success()) {
+                let text = r.text().await.unwrap_or_default();
+                let prefix = format!("{mc_version}-");
+                let filtered: Vec<String> = parse_maven_xml_versions(&text)
+                    .into_iter()
+                    .filter(|v| v.starts_with(&prefix))
+                    .collect();
+                (filtered, true)
+            } else {
+                (Vec::new(), true)
+            };
 
         let (versions, old_api) = if legacy_versions.is_empty() {
             let text = fetch_text(client, NEW_META_URL)
@@ -180,12 +194,15 @@ impl NeoForgeMC {
                 r#type: Some("neoforge".into()),
                 sha1: None,
             };
-            let downloader = Downloader::new(options.timeout_secs, 1);
+            let downloader = Downloader::new(options.timeout_secs, 1, options.force_ipv4);
             downloader
                 .download_multiple(vec![item], event_tx.clone())
                 .await
                 .map_err(|e| {
-                    LoaderError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                    LoaderError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e.to_string(),
+                    ))
                 })?;
         }
 
@@ -350,17 +367,25 @@ fn extract_game_args(version: &ForgeVersionSection) -> Vec<String> {
     args
 }
 
-fn extract_jvm_args(loader_base: &Path, version_id: &str, version: &ForgeVersionSection) -> Vec<String> {
+fn extract_jvm_args(
+    loader_base: &Path,
+    version_id: &str,
+    version: &ForgeVersionSection,
+) -> Vec<String> {
     let lib_dir = loader_base.join("libraries").to_string_lossy().into_owned();
-    let sep = if cfg!(target_os = "windows") { ";" } else { ":" };
+    let sep = if cfg!(target_os = "windows") {
+        ";"
+    } else {
+        ":"
+    };
     let mut args = Vec::new();
     if let Some(forge_args) = &version.arguments {
         for entry in &forge_args.jvm {
             if let Some(s) = entry.as_str() {
                 args.push(
                     s.replace("${library_directory}", &lib_dir)
-                     .replace("${classpath_separator}", sep)
-                     .replace("${version_name}", version_id),
+                        .replace("${classpath_separator}", sep)
+                        .replace("${version_name}", version_id),
                 );
             }
         }
@@ -377,16 +402,18 @@ fn build_library_assets(loader_base: &Path, version: &ForgeVersionSection) -> Ve
             continue;
         }
         let (path, sha1, size, url) = resolve_library_entry(loader_base, lib);
-        items.push(AssetItem::Asset { path, sha1, size, url });
+        items.push(AssetItem::Asset {
+            path,
+            sha1,
+            size,
+            url,
+        });
     }
 
     items
 }
 
-fn resolve_library_entry(
-    loader_base: &Path,
-    lib: &LoaderLibrary,
-) -> (String, String, u64, String) {
+fn resolve_library_entry(loader_base: &Path, lib: &LoaderLibrary) -> (String, String, u64, String) {
     let libs_dir = loader_base.join("libraries");
 
     let artifact = lib.downloads.as_ref().and_then(|d| d.artifact.as_ref());
