@@ -549,6 +549,7 @@ mod tests {
             bypass_offline: false,
             skip_bundle_check: false,
             force_ipv4: false,
+            dns: None,
         }
     }
 

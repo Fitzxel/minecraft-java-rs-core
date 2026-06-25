@@ -297,6 +297,7 @@ fn launcher_constructs_and_save_dir_is_correct() {
         bypass_offline: false,
         skip_bundle_check: false,
         force_ipv4: false,
+        dns: None,
     };
 
     let launcher = Launcher::new(options);
@@ -343,6 +344,7 @@ async fn get_version_json_real_network_resolves_latest_release() {
         bypass_offline: false,
         skip_bundle_check: false,
         force_ipv4: false,
+        dns: None,
     };
 
     let client = reqwest::Client::builder()
@@ -407,6 +409,7 @@ async fn download_game_end_to_end() {
         bypass_offline: false,
         skip_bundle_check: false,
         force_ipv4: false,
+        dns: None,
     };
 
     let (tx, mut rx) = mpsc::channel(256);

@@ -96,6 +96,20 @@ pub struct LaunchOptions {
     /// (which does Happy Eyeballs; reqwest does not). Default: `false`.
     #[serde(default)]
     pub force_ipv4: bool,
+
+    /// Resolve every hostname through DNS-over-HTTPS against this resolver IP
+    /// instead of the system resolver (e.g. `1.1.1.1` for Cloudflare).
+    ///
+    /// Connects to the resolver by its literal IP, so it bypasses both ISP DNS
+    /// hijacking/poisoning **and** port-53 blocking — failure modes that a plain
+    /// nameserver change cannot fix and that typically present as "downloads
+    /// work over a VPN but fail on this network". Composes with [`force_ipv4`]:
+    /// when both are set, only A records are requested. Default: `None` (use the
+    /// system resolver).
+    ///
+    /// [`force_ipv4`]: Self::force_ipv4
+    #[serde(default)]
+    pub dns: Option<std::net::IpAddr>,
 }
 
 impl LaunchOptions {
@@ -330,6 +344,7 @@ mod tests {
             bypass_offline: false,
             skip_bundle_check: false,
             force_ipv4: false,
+            dns: None,
         }
     }
 }

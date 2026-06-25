@@ -58,6 +58,7 @@ struct Args {
     verify: bool,
     skip_bundle_check: bool,
     force_ipv4: bool,
+    dns: Option<std::net::IpAddr>,
     auto_close: Option<u64>,
 }
 
@@ -101,6 +102,7 @@ impl Args {
             verify: argv.iter().any(|a| a == "--verify"),
             skip_bundle_check: argv.iter().any(|a| a == "--skip-bundle-check"),
             force_ipv4: argv.iter().any(|a| a == "--force-ipv4"),
+            dns: flag_val(&argv, "--dns").and_then(|s| s.parse::<std::net::IpAddr>().ok()),
             auto_close: flag_val(&argv, "--auto-close").and_then(|s| s.parse::<u64>().ok()),
         }
     }
@@ -128,6 +130,8 @@ OPTIONS:
   --only-download           Download game files, don't launch
   --skip-bundle-check       Skip integrity check if gameData.json exists (fast re-launch)
   --force-ipv4              Force IPv4 for downloads (fixes broken-IPv6 connection errors)
+  --dns <IP>                Resolve via DNS-over-HTTPS to this IP, e.g. 1.1.1.1
+                              (bypasses ISP DNS hijacking / port-53 blocking)
   --verify                  Re-verify SHA-1 of all files after download
   --auto-close <SECS>       Kill Minecraft after N seconds
   -h, --help                Print this message
@@ -259,6 +263,7 @@ async fn main() {
         bypass_offline: true,
         skip_bundle_check: args.skip_bundle_check,
         force_ipv4: args.force_ipv4,
+        dns: args.dns,
     };
 
     // ── Banner ────────────────────────────────────────────────────────────────

@@ -252,6 +252,7 @@ async fn try_mojang(
         options.timeout_secs,
         options.clamped_concurrency(),
         options.force_ipv4,
+        options.dns,
     );
     downloader
         .download_multiple(items, event_tx.clone())
@@ -345,7 +346,7 @@ async fn get_from_adoptium(
         sha1: None,
     };
 
-    let downloader = Downloader::new(options.timeout_secs, 1, options.force_ipv4);
+    let downloader = Downloader::new(options.timeout_secs, 1, options.force_ipv4, options.dns);
     downloader
         .download_multiple(vec![item], event_tx.clone())
         .await?;
@@ -471,6 +472,7 @@ mod tests {
             bypass_offline: false,
             skip_bundle_check: false,
             force_ipv4: false,
+            dns: None,
         }
     }
 

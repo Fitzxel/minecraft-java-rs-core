@@ -48,8 +48,13 @@ pub struct Downloader {
 }
 
 impl Downloader {
-    pub fn new(timeout_secs: u64, concurrency: u32, force_ipv4: bool) -> Self {
-        let client = crate::net::client::build_client(timeout_secs, force_ipv4)
+    pub fn new(
+        timeout_secs: u64,
+        concurrency: u32,
+        force_ipv4: bool,
+        dns: Option<std::net::IpAddr>,
+    ) -> Self {
+        let client = crate::net::client::build_client(timeout_secs, force_ipv4, dns)
             .expect("failed to build reqwest client");
         Self {
             client,
@@ -361,7 +366,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     fn make_downloader() -> Downloader {
-        Downloader::new(5, 4, false)
+        Downloader::new(5, 4, false, None)
     }
 
     #[test]
@@ -400,20 +405,20 @@ mod tests {
             r#type: None,
             sha1: None,
         };
-        let d = Downloader::new(1, 1, false); // 1-second timeout
+        let d = Downloader::new(1, 1, false, None); // 1-second timeout
         let result = d.download_file(&item).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn check_url_unreachable_returns_false() {
-        let d = Downloader::new(1, 1, false);
+        let d = Downloader::new(1, 1, false, None);
         assert!(!d.check_url("http://127.0.0.1:1/test").await);
     }
 
     #[tokio::test]
     async fn check_mirror_all_bad_returns_none() {
-        let d = Downloader::new(1, 1, false);
+        let d = Downloader::new(1, 1, false, None);
         let result = d
             .check_mirror(&["http://127.0.0.1:1"], "/some/path.jar")
             .await;
@@ -432,7 +437,7 @@ mod tests {
             r#type: Some("test".into()),
             sha1: None,
         };
-        let d = Downloader::new(1, 1, false);
+        let d = Downloader::new(1, 1, false, None);
         let (tx, _rx) = mpsc::channel(16);
         let result = d.download_multiple(vec![item], tx).await;
         assert!(result.is_err());
@@ -451,7 +456,7 @@ mod tests {
             r#type: None,
             sha1: None,
         };
-        let d = Downloader::new(1, 1, false);
+        let d = Downloader::new(1, 1, false, None);
         let _ = d.download_file(&item).await;
 
         let tmp = {

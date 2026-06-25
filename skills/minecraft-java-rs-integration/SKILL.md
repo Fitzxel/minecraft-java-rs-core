@@ -2,7 +2,7 @@
 name: minecraft-java-rs-integration
 metadata:
   author: Fitzxel
-  version: "0.3.0"
+  version: "0.4.0"
 description: >
   Guide and code generator for integrating the minecraft-java-rs-core Rust library
   into external projects. Use this skill whenever someone wants to use
@@ -496,6 +496,7 @@ LaunchOptions {
     verify: false,              // re-verify SHA-1 after every download
     skip_bundle_check: false,   // set true to skip integrity check when gameData.json exists
     force_ipv4: false,          // set true to force IPv4 (fixes broken-IPv6 download errors)
+    dns: None,                  // Some("1.1.1.1".parse()?) to resolve via DNS-over-HTTPS
     ..Default::default()
 }
 ```
@@ -522,6 +523,48 @@ In that situation, set `force_ipv4: true` and the downloads succeed without a VP
 > Leave it `false` by default. Forcing IPv4 would break users on genuinely
 > **IPv6-only** networks, so enable it only as a remedy (or expose it as a toggle /
 > "having download problems?" option in your UI).
+
+### `dns` — bypassing a broken or hijacked ISP resolver
+
+Default `None` (system resolver). Set `dns: Some(ip)` — e.g. `Some("1.1.1.1".parse()?)`
+for Cloudflare — to resolve **every** hostname through **DNS-over-HTTPS** against that
+resolver IP instead of the operating system's. The launcher connects to the resolver by
+its **literal IP** (so no system lookup is needed to bootstrap) and issues JSON DoH
+queries to `https://<ip>/dns-query`.
+
+**When to enable it.** `force_ipv4` fixes a broken *IPv6 route*; `dns` fixes a broken
+*name resolution* path. Because DoH rides HTTPS to a literal IP, it bypasses both:
+
+- **ISP DNS hijacking / poisoning** — the resolver returns wrong, filtered, or `NXDOMAIN`
+  answers for Mojang/asset hosts.
+- **Port-53 blocking / interception** — networks that drop or rewrite plain UDP/TCP 53
+  traffic (so merely *changing* the system nameserver to 1.1.1.1 doesn't help).
+
+Typical symptoms are the same "works over a VPN, fails on this network" pattern, but the
+underlying cause shows up as a resolution failure (e.g. *"Temporary failure in name
+resolution"*, or a connection to a clearly wrong IP) rather than an unreachable route.
+
+`dns` **composes with `force_ipv4`**: when both are set, only A records are requested, so
+you get Cloudflare resolution *and* IPv4-only connections. Any DoH-capable resolver IP
+with a valid certificate for its own address works (Cloudflare `1.1.1.1`, Google
+`8.8.8.8`, Quad9 `9.9.9.9`); `1.1.1.1` is the typical choice.
+
+> Like `force_ipv4`, leave it `None` by default and surface it as a remedy. Each
+> resolution becomes an HTTPS round-trip to the resolver, so only opt in when the
+> system resolver is actually the problem.
+
+**Verifying it works.** Resolution is invisible from the outside — a successful download
+doesn't prove DoH was used. Set the `MJRS_DNS_DEBUG=1` environment variable to print one
+line per resolution to stderr:
+
+```
+[dns] DoH via 1.1.1.1 → resources.download.minecraft.net = [13.107.253.33, 13.107.226.33]
+[dns] DoH via 1.1.1.1 → libraries.minecraft.net = ERROR (could not establish connection)
+```
+
+It is silent unless the variable is set (a single `getenv` per lookup otherwise), so it is
+safe to leave shippable — handy as a "run with this and send me the output" support tool.
+Only the DoH path logs; the system/`force_ipv4` resolvers don't.
 
 ---
 

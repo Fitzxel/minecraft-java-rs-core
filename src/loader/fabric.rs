@@ -191,6 +191,7 @@ impl FabricMC {
                 options.timeout_secs,
                 options.clamped_concurrency(),
                 options.force_ipv4,
+                options.dns,
             );
             downloader
                 .download_multiple(pending, event_tx.clone())

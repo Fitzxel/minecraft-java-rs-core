@@ -1,10 +1,11 @@
 //! Centralised reqwest client construction and transport-error description.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+use serde::Deserialize;
 
 /// A DNS resolver that returns only IPv4 addresses.
 ///
@@ -29,14 +30,142 @@ impl Resolve for Ipv4OnlyResolver {
     }
 }
 
+/// A DNS-over-HTTPS resolver pointed at a fixed resolver IP (e.g. `1.1.1.1`).
+///
+/// Names are resolved with JSON DoH queries to `https://<ip>/dns-query`,
+/// connecting to the resolver by its *literal IP* so no system DNS lookup is
+/// needed to bootstrap. This bypasses both ISP DNS hijacking/poisoning **and**
+/// port-53 blocking — the failure modes behind "works over a VPN, fails on this
+/// network" that a plain change of nameserver cannot fix.
+///
+/// When `ipv4_only` is set, only A records are requested (composes with
+/// `force_ipv4`).
+#[derive(Debug)]
+struct DohResolver {
+    /// Bootstrap client. It MUST NOT use a custom resolver itself: it connects
+    /// to the DoH endpoint by literal IP, so wiring it through `DohResolver`
+    /// would recurse forever.
+    client: reqwest::Client,
+    /// Fully-formed endpoint, e.g. `https://1.1.1.1/dns-query`.
+    endpoint: String,
+    /// Resolver IP, kept for human-readable diagnostics (`MJRS_DNS_DEBUG`).
+    resolver: IpAddr,
+    ipv4_only: bool,
+}
+
+/// Subset of the Cloudflare/Google JSON DoH response we care about.
+#[derive(Deserialize)]
+struct DohResponse {
+    #[serde(rename = "Answer", default)]
+    answer: Vec<DohAnswer>,
+}
+
+#[derive(Deserialize)]
+struct DohAnswer {
+    /// Record payload. For A/AAAA it is an IP literal; for CNAME etc. it is a
+    /// hostname, which simply fails to parse and is skipped.
+    data: String,
+}
+
+impl DohResolver {
+    async fn query(
+        client: reqwest::Client,
+        endpoint: String,
+        host: String,
+        rtype: &'static str,
+    ) -> Result<Vec<IpAddr>, Box<dyn std::error::Error + Send + Sync>> {
+        let resp = client
+            .get(&endpoint)
+            .query(&[("name", host.as_str()), ("type", rtype)])
+            .header("accept", "application/dns-json")
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<DohResponse>()
+            .await?;
+        Ok(resp
+            .answer
+            .into_iter()
+            .filter_map(|a| a.data.parse::<IpAddr>().ok())
+            .collect())
+    }
+}
+
+impl Resolve for DohResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let client = self.client.clone();
+        let endpoint = self.endpoint.clone();
+        let resolver = self.resolver;
+        let ipv4_only = self.ipv4_only;
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            // Opt-in diagnostics: silent unless MJRS_DNS_DEBUG is set. Lets users
+            // (and support) confirm resolution actually flows through DoH without
+            // a packet capture.
+            let debug = std::env::var_os("MJRS_DNS_DEBUG").is_some();
+
+            let mut ips =
+                match DohResolver::query(client.clone(), endpoint.clone(), host.clone(), "A").await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if debug {
+                            eprintln!("[dns] DoH via {resolver} → {host} = ERROR ({e})");
+                        }
+                        return Err(e);
+                    }
+                };
+            if !ipv4_only {
+                // A missing/failing AAAA lookup is non-fatal: most hosts that
+                // resolve over IPv4 simply have no IPv6 record.
+                if let Ok(v6) = DohResolver::query(client, endpoint, host.clone(), "AAAA").await {
+                    ips.extend(v6);
+                }
+            }
+            if debug {
+                eprintln!("[dns] DoH via {resolver} → {host} = {ips:?}");
+            }
+            let addrs: Vec<SocketAddr> = ips.into_iter().map(|ip| SocketAddr::new(ip, 0)).collect();
+            Ok(Box::new(addrs.into_iter()) as Addrs)
+        })
+    }
+}
+
 /// Build a reqwest client with the shared launcher configuration.
 ///
-/// When `force_ipv4` is `true`, DNS resolution is restricted to IPv4 addresses
-/// (see [`Ipv4OnlyResolver`]).
-pub fn build_client(timeout_secs: u64, force_ipv4: bool) -> reqwest::Result<reqwest::Client> {
+/// DNS behaviour, in precedence order:
+/// - `dns = Some(ip)` → resolve every name via DNS-over-HTTPS against that
+///   resolver IP (see [`DohResolver`]); honours `force_ipv4` by requesting only
+///   A records.
+/// - `dns = None` and `force_ipv4 = true` → use the system resolver but keep
+///   only IPv4 results (see [`Ipv4OnlyResolver`]).
+/// - otherwise → reqwest's default system resolver.
+pub fn build_client(
+    timeout_secs: u64,
+    force_ipv4: bool,
+    dns: Option<IpAddr>,
+) -> reqwest::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(timeout_secs));
-    if force_ipv4 {
-        builder = builder.dns_resolver(Arc::new(Ipv4OnlyResolver));
+    match dns {
+        Some(ip) => {
+            let boot = reqwest::Client::builder()
+                .timeout(Duration::from_secs(timeout_secs))
+                .build()?;
+            let endpoint = match ip {
+                IpAddr::V4(v4) => format!("https://{v4}/dns-query"),
+                IpAddr::V6(v6) => format!("https://[{v6}]/dns-query"),
+            };
+            builder = builder.dns_resolver(Arc::new(DohResolver {
+                client: boot,
+                endpoint,
+                resolver: ip,
+                ipv4_only: force_ipv4,
+            }));
+        }
+        None if force_ipv4 => {
+            builder = builder.dns_resolver(Arc::new(Ipv4OnlyResolver));
+        }
+        None => {}
     }
     builder.build()
 }
@@ -85,8 +214,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_client_succeeds_in_both_modes() {
-        assert!(build_client(10, false).is_ok());
-        assert!(build_client(10, true).is_ok());
+    fn build_client_succeeds_in_all_modes() {
+        assert!(build_client(10, false, None).is_ok());
+        assert!(build_client(10, true, None).is_ok());
+        assert!(build_client(10, false, Some("1.1.1.1".parse().unwrap())).is_ok());
+        assert!(build_client(10, true, Some("1.1.1.1".parse().unwrap())).is_ok());
+    }
+
+    /// Live check that the DoH path resolves real names end-to-end: rustls must
+    /// accept Cloudflare's cert when connecting to the literal IP `1.1.1.1`, and
+    /// the resolver must hand reqwest at least one usable address.
+    #[tokio::test]
+    #[ignore = "requires internet: queries Cloudflare DoH at 1.1.1.1"]
+    async fn doh_resolver_resolves_real_host() {
+        // Also exercises the MJRS_DNS_DEBUG diagnostics path; run with
+        // `--ignored --nocapture` to see the `[dns] DoH via …` line.
+        std::env::set_var("MJRS_DNS_DEBUG", "1");
+
+        let resolver = DohResolver {
+            client: reqwest::Client::builder().build().unwrap(),
+            endpoint: "https://1.1.1.1/dns-query".to_owned(),
+            resolver: "1.1.1.1".parse().unwrap(),
+            ipv4_only: true,
+        };
+        let name: Name = "resources.download.minecraft.net".parse().unwrap();
+        let addrs: Vec<SocketAddr> = resolver.resolve(name).await.unwrap().collect();
+        assert!(!addrs.is_empty(), "DoH returned no addresses");
+        assert!(addrs.iter().all(SocketAddr::is_ipv4), "ipv4_only honoured");
+
+        std::env::remove_var("MJRS_DNS_DEBUG");
     }
 }

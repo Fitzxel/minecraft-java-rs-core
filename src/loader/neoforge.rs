@@ -194,7 +194,8 @@ impl NeoForgeMC {
                 r#type: Some("neoforge".into()),
                 sha1: None,
             };
-            let downloader = Downloader::new(options.timeout_secs, 1, options.force_ipv4);
+            let downloader =
+                Downloader::new(options.timeout_secs, 1, options.force_ipv4, options.dns);
             downloader
                 .download_multiple(vec![item], event_tx.clone())
                 .await

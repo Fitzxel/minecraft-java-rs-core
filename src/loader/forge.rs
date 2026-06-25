@@ -169,7 +169,8 @@ impl ForgeMC {
                 r#type: Some("forge".into()),
                 sha1: None,
             };
-            let downloader = Downloader::new(options.timeout_secs, 1, options.force_ipv4);
+            let downloader =
+                Downloader::new(options.timeout_secs, 1, options.force_ipv4, options.dns);
             downloader
                 .download_multiple(vec![item], event_tx.clone())
                 .await
@@ -865,6 +866,7 @@ async fn download_profile_libraries(
             options.timeout_secs,
             options.clamped_concurrency(),
             options.force_ipv4,
+            options.dns,
         );
         downloader
             .download_multiple(items, event_tx.clone())

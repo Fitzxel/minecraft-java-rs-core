@@ -98,9 +98,12 @@ impl Launcher {
             if let Ok(mut cached) = load_game_data(&options.save_dir()).await {
                 let java_present = std::path::Path::new(&cached.minecraft_java.path).exists();
                 if !java_present {
-                    let client =
-                        crate::net::client::build_client(options.timeout_secs, options.force_ipv4)
-                            .map_err(LaunchError::Http)?;
+                    let client = crate::net::client::build_client(
+                        options.timeout_secs,
+                        options.force_ipv4,
+                        options.dns,
+                    )
+                    .map_err(LaunchError::Http)?;
                     let java_result =
                         get_java_files(options, &cached.minecraft_json, &client, &event_tx).await?;
                     cached.minecraft_java = JavaInfo {
@@ -117,8 +120,9 @@ impl Launcher {
         }
 
         // ── Shared HTTP client ────────────────────────────────────────────────
-        let client = crate::net::client::build_client(options.timeout_secs, options.force_ipv4)
-            .map_err(LaunchError::Http)?;
+        let client =
+            crate::net::client::build_client(options.timeout_secs, options.force_ipv4, options.dns)
+                .map_err(LaunchError::Http)?;
 
         // ── Version JSON ──────────────────────────────────────────────────────
         let mut version_json = get_version_json(options, &client).await?;
@@ -142,6 +146,7 @@ impl Launcher {
                 options.timeout_secs,
                 options.clamped_concurrency(),
                 options.force_ipv4,
+                options.dns,
             );
             downloader
                 .download_multiple(pending, event_tx.clone())
@@ -217,6 +222,7 @@ impl Launcher {
                     options.timeout_secs,
                     options.clamped_concurrency(),
                     options.force_ipv4,
+                    options.dns,
                 );
                 downloader
                     .download_multiple(loader_pending, event_tx.clone())
@@ -628,6 +634,7 @@ mod tests {
             bypass_offline: false,
             skip_bundle_check: false,
             force_ipv4: false,
+            dns: None,
         }
     }
 
