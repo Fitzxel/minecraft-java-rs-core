@@ -141,8 +141,64 @@ pub async fn get_assets_others(
     Ok(items)
 }
 
-/// Extract all native JARs in `bundle` (`NativeAsset` items) to
-/// `<options.path>/versions/<id>/natives/`.
+/// Base natives directory for a version: `<path>/versions/<id>/natives`.
+///
+/// This is the value `${natives_directory}` expands to in the version JSON's
+/// JVM arguments.
+pub fn natives_base_dir(options: &LaunchOptions, version_json: &MinecraftVersionJson) -> PathBuf {
+    options
+        .path
+        .join("versions")
+        .join(&version_json.id)
+        .join("natives")
+}
+
+/// The directory natives must be extracted to so the JVM can load them.
+///
+/// `-Djava.library.path` is a flat search path, and its value is version-
+/// dependent:
+/// - Minecraft 26.x (LWJGL 3.4) sets it to `${natives_directory}/java` and
+///   reserves sibling dirs (`/lwjgl`, `/jna`, `/netty`) as runtime scratch
+///   space — so the loadable binaries belong in the `java` subdirectory.
+/// - Older versions use `${natives_directory}` itself.
+///
+/// We mirror whatever the version's own `java.library.path` arg resolves to, so
+/// extraction and the JVM agree on one location.
+pub fn natives_dir_for(options: &LaunchOptions, version_json: &MinecraftVersionJson) -> PathBuf {
+    let base = natives_base_dir(options, version_json);
+    match natives_library_subdir(version_json) {
+        Some(sub) => base.join(sub),
+        None => base,
+    }
+}
+
+/// Component appended to `${natives_directory}` by the version's
+/// `-Djava.library.path` JVM argument, if any (e.g. `"java"` for 26.x).
+///
+/// Returns `None` when the version points `java.library.path` straight at
+/// `${natives_directory}` or doesn't specify one.
+fn natives_library_subdir(version_json: &MinecraftVersionJson) -> Option<String> {
+    const PREFIX: &str = "-Djava.library.path=${natives_directory}";
+    let jvm = version_json.arguments.as_ref()?.jvm.as_ref()?;
+    for entry in jvm {
+        // These properties are always plain (unconditional) string entries.
+        let Some(s) = entry.as_str() else { continue };
+        let Some(rest) = s.strip_prefix(PREFIX) else {
+            continue;
+        };
+        let rest = rest.trim_start_matches('/');
+        return if rest.is_empty() {
+            None
+        } else {
+            Some(rest.to_string())
+        };
+    }
+    None
+}
+
+/// Extract all native JARs in `bundle` (`NativeAsset` items) into the directory
+/// that the version's `-Djava.library.path` points to (see
+/// [`natives_dir_for`]).
 ///
 /// Skips `META-INF/` entries; sets executable bit on Unix (0o755).
 /// Uses `spawn_blocking` so the synchronous `zip` operations don't block the
@@ -164,11 +220,7 @@ pub async fn extract_natives(
         return Ok(());
     }
 
-    let natives_dir = options
-        .path
-        .join("versions")
-        .join(&version_json.id)
-        .join("natives");
+    let natives_dir = natives_dir_for(options, version_json);
     tokio::fs::create_dir_all(&natives_dir).await?;
 
     for jar_path in native_paths {
@@ -282,7 +334,17 @@ fn resolve_regular_library(base: &Path, lib: &Library) -> Option<AssetItem> {
     None
 }
 
-/// Extract the non-META-INF file entries from a JAR/ZIP to `dest`.
+/// Extract the native binaries from a JAR/ZIP into `dest`, **flattened**.
+///
+/// `-Djava.library.path` is a flat search path — the JVM does not recurse into
+/// subdirectories — so every native binary must land directly in `dest`. The
+/// jar's internal layout varies by LWJGL version:
+/// - LWJGL ≤ 3.3 puts binaries at the jar root (`liblwjgl.so`).
+/// - LWJGL ≥ 3.4 (Minecraft 26.x) nests them under `<os>/<arch>/…`
+///   (`linux/x64/org/lwjgl/liblwjgl.so`).
+///
+/// Extracting by file name handles both; preserving the path would hide the
+/// 3.4 binaries in a subdirectory and crash with "can't find liblwjgl.so".
 ///
 /// Called inside `spawn_blocking`; all I/O is synchronous.
 fn extract_jar_to_dir(jar_path: &Path, dest: &Path) -> Result<(), LaunchError> {
@@ -297,29 +359,29 @@ fn extract_jar_to_dir(jar_path: &Path, dest: &Path) -> Result<(), LaunchError> {
 
         let name = entry.name().to_string();
 
-        if name.starts_with("META-INF") {
+        // META-INF holds the manifest and per-binary `.sha1`/`.git` markers —
+        // none are loadable libraries.
+        if name.starts_with("META-INF") || entry.is_dir() {
             continue;
         }
 
-        let out = dest.join(&name);
+        // Flatten: drop the internal directory structure and key by file name.
+        let file_name = match Path::new(&name).file_name() {
+            Some(f) => f,
+            None => continue,
+        };
+        let out = dest.join(file_name);
 
-        if entry.is_dir() {
-            std::fs::create_dir_all(&out)?;
-        } else {
-            if let Some(parent) = out.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let mut data = Vec::with_capacity(entry.size() as usize);
-            entry.read_to_end(&mut data)?;
-            std::fs::write(&out, &data)?;
+        let mut data = Vec::with_capacity(entry.size() as usize);
+        entry.read_to_end(&mut data)?;
+        std::fs::write(&out, &data)?;
 
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = std::fs::metadata(&out)?.permissions();
-                perms.set_mode(0o755);
-                std::fs::set_permissions(&out, perms)?;
-            }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&out)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&out, perms)?;
         }
     }
 
@@ -610,8 +672,20 @@ mod tests {
             w.start_file("META-INF/MANIFEST.MF", opts_zip).unwrap();
             w.write_all(b"Manifest-Version: 1.0\n").unwrap();
 
+            // META-INF marker files must never be extracted.
+            w.start_file("META-INF/linux/x64/org/lwjgl/liblwjgl.so.sha1", opts_zip)
+                .unwrap();
+            w.write_all(b"deadbeef").unwrap();
+
+            // LWJGL ≤ 3.3 layout: binary at the jar root.
             w.start_file("liblwjgl.so", opts_zip).unwrap();
-            w.write_all(b"ELF native library").unwrap();
+            w.write_all(b"ELF root native").unwrap();
+
+            // LWJGL ≥ 3.4 layout: binary nested under <os>/<arch>/… — must be
+            // flattened into the natives dir, not buried in subdirectories.
+            w.start_file("linux/x64/org/lwjgl/liblwjgl_opengl.so", opts_zip)
+                .unwrap();
+            w.write_all(b"ELF nested native").unwrap();
 
             let finished = w.finish().unwrap();
             std::fs::write(&jar_path, finished.get_ref()).unwrap();
@@ -630,10 +704,94 @@ mod tests {
         extract_natives(&options, &vj, &bundle).await.unwrap();
 
         let natives_dir = dir.path().join("versions").join("1.20.4").join("natives");
-        assert!(natives_dir.join("liblwjgl.so").exists());
-        assert!(!natives_dir.join("META-INF").exists());
 
-        let content = std::fs::read(natives_dir.join("liblwjgl.so")).unwrap();
-        assert_eq!(content, b"ELF native library");
+        // Root-level binary lands directly in the natives dir.
+        assert_eq!(
+            std::fs::read(natives_dir.join("liblwjgl.so")).unwrap(),
+            b"ELF root native"
+        );
+        // Nested binary is flattened to the natives dir root (the fix).
+        assert_eq!(
+            std::fs::read(natives_dir.join("liblwjgl_opengl.so")).unwrap(),
+            b"ELF nested native"
+        );
+        // No directory structure or META-INF leaks through.
+        assert!(!natives_dir.join("linux").exists());
+        assert!(!natives_dir.join("META-INF").exists());
+        assert!(!natives_dir.join("liblwjgl.so.sha1").exists());
+    }
+
+    /// Build a version whose `arguments.jvm` mirrors Minecraft 26.x: it points
+    /// `java.library.path` at the `${natives_directory}/java` subdirectory.
+    fn version_with_java_subdir(id: &str) -> MinecraftVersionJson {
+        let mut vj = bare_version();
+        vj.id = id.to_string();
+        vj.arguments = Some(crate::models::minecraft::Arguments {
+            game: None,
+            jvm: Some(vec![
+                serde_json::Value::String("--enable-native-access=ALL-UNNAMED".into()),
+                serde_json::Value::String("-Djava.library.path=${natives_directory}/java".into()),
+                serde_json::Value::String(
+                    "-Dorg.lwjgl.system.SharedLibraryExtractPath=${natives_directory}/lwjgl".into(),
+                ),
+            ]),
+        });
+        vj
+    }
+
+    #[test]
+    fn natives_subdir_detected_for_modern_scheme() {
+        let vj = version_with_java_subdir("26.2");
+        assert_eq!(natives_library_subdir(&vj), Some("java".to_string()));
+        // Legacy versions (no arguments.jvm) extract straight to the root.
+        assert_eq!(natives_library_subdir(&bare_version()), None);
+
+        let options = opts(PathBuf::from("/tmp/mc"));
+        let expected = options
+            .path
+            .join("versions")
+            .join("26.2")
+            .join("natives")
+            .join("java");
+        assert_eq!(natives_dir_for(&options, &vj), expected);
+    }
+
+    #[tokio::test]
+    async fn extract_natives_targets_java_subdir_on_modern_versions() {
+        // Regression: Minecraft 26.x sets `java.library.path=${natives_directory}/java`,
+        // so liblwjgl.so must land in `natives/java/`, not `natives/`. Extracting
+        // to the root makes the JVM crash with "Failed to locate library: liblwjgl.so".
+        let dir = TempDir::new().unwrap();
+        let jar_path = dir.path().join("native.jar");
+        {
+            use zip::write::SimpleFileOptions;
+            let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            let o = SimpleFileOptions::default();
+            w.start_file("linux/x64/org/lwjgl/liblwjgl.so", o).unwrap();
+            w.write_all(b"ELF").unwrap();
+            let finished = w.finish().unwrap();
+            std::fs::write(&jar_path, finished.get_ref()).unwrap();
+        }
+
+        let vj = version_with_java_subdir("26.2");
+        let options = opts(dir.path().to_path_buf());
+        let bundle = vec![AssetItem::NativeAsset {
+            path: jar_path.to_string_lossy().into_owned(),
+            sha1: String::new(),
+            size: 0,
+            url: String::new(),
+        }];
+
+        extract_natives(&options, &vj, &bundle).await.unwrap();
+
+        let natives_root = dir.path().join("versions").join("26.2").join("natives");
+        assert!(
+            natives_root.join("java").join("liblwjgl.so").exists(),
+            "liblwjgl.so must be in the java.library.path subdir"
+        );
+        assert!(
+            !natives_root.join("liblwjgl.so").exists(),
+            "must not be left at the natives root for modern versions"
+        );
     }
 }
