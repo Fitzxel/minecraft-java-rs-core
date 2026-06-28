@@ -48,6 +48,7 @@ pub async fn get_java_files(
     }
 
     let (component, major_version) = java_component(options, version_json);
+    let mojang_component = mojang_runtime_component(options, version_json);
     let platform = mojang_platform_key(options.intel_enabled_mac);
     let runtime_root = options
         .path
@@ -66,7 +67,7 @@ pub async fn get_java_files(
 
     if let Some(result) = try_mojang(
         options,
-        &component,
+        &mojang_component,
         &platform,
         &runtime_root,
         client,
@@ -123,6 +124,44 @@ pub fn java_component(
     }
 }
 
+/// The Mojang runtime-component name to look up in `all.json` for this
+/// version. Unlike [`java_component`], this uses the version JSON's actual
+/// `javaVersion.component` field (e.g. `java-runtime-alpha` for 1.17) rather
+/// than synthesising `jre-{major}` from the major version.
+///
+/// Why this matters: 1.17 ships `{"component":"java-runtime-alpha",
+/// "majorVersion":16}`. Mojang's `all.json` keys runtime entries by the
+/// component name, not by `jre-{N}` — synthesising `jre-16` produces zero
+/// hits, the lookup fails, the launcher falls through to Adoptium with
+/// major=16, and crashes with "No Adoptium release found for Java 16"
+/// (Temurin dropped 16 from LTS in 2024). Using the real component name
+/// resolves 1.17 from Mojang directly on every platform where it's
+/// published (linux, mac-os, windows-x64, windows-x86).
+///
+/// Falls back to `jre-{major}` for legacy versions that don't carry a
+/// `component` field, so the lookup behaviour is unchanged for them.
+pub fn mojang_runtime_component(
+    options: &LaunchOptions,
+    version_json: &MinecraftVersionJson,
+) -> String {
+    if let Some(ver) = &options.java.version {
+        let major = ver.parse::<u32>().unwrap_or(8);
+        return format!("jre-{major}");
+    }
+    match &version_json.java_version {
+        Some(jv) => {
+            if let Some(comp) = jv.component.as_deref() {
+                if !comp.is_empty() {
+                    return comp.to_string();
+                }
+            }
+            let major = jv.major_version.unwrap_or(8);
+            format!("jre-{major}")
+        }
+        None => "jre-8".into(),
+    }
+}
+
 pub fn java_bin_path(runtime_root: &Path) -> PathBuf {
     let bin = if cfg!(target_os = "windows") {
         "javaw.exe"
@@ -149,6 +188,22 @@ fn find_cached_java_bin(runtime_root: &Path) -> PathBuf {
         }
     }
     primary
+}
+
+/// Adoptium (Temurin) only ships LTS major versions: 8, 11, 17, 21, 25.
+/// Non-LTS versions (9, 10, 12-16, 18-20, 22-24) are **not** published —
+/// the API returns an empty array and the launcher would otherwise crash
+/// with "No Adoptium release found for Java N on os/arch". When the version
+/// JSON asks for one of those (e.g. 1.17 → Java 16, dropped from LTS in
+/// 2024), substitute the next LTS at or above the requested version.
+///
+/// Returns the requested version unchanged when it's already an LTS.
+fn adoptium_major_version(requested: u32) -> u32 {
+    const LTS: &[u32] = &[8, 11, 17, 21, 25];
+    if LTS.contains(&requested) {
+        return requested;
+    }
+    LTS.iter().copied().find(|&v| v >= requested).unwrap_or(25)
 }
 
 fn adoptium_os() -> &'static str {
@@ -312,8 +367,13 @@ async fn get_from_adoptium(
     let arch = adoptium_arch(options.intel_enabled_mac);
     let image_type = &options.java.image_type;
 
+    // Adoptium only publishes LTS; non-LTS requests (e.g. 1.17 → Java 16,
+    // dropped from LTS in 2024) are substituted to the next available LTS
+    // at or above the requested major. See `adoptium_major_version`.
+    let adoptium_version = adoptium_major_version(major_version);
+
     let url = format!(
-        "{ADOPTIUM_API_BASE}/{major_version}/hotspot?os={os}&architecture={arch}&image_type={image_type}&jvm_impl=hotspot&vendor=eclipse"
+        "{ADOPTIUM_API_BASE}/{adoptium_version}/hotspot?os={os}&architecture={arch}&image_type={image_type}&jvm_impl=hotspot&vendor=eclipse"
     );
 
     let releases: Vec<AdoptiumRelease> = fetch_json(client, &url)
@@ -321,9 +381,14 @@ async fn get_from_adoptium(
         .map_err(LaunchError::InvalidData)?;
 
     let release = releases.into_iter().next().ok_or_else(|| {
+        // Surface the substituted version in the error so users can see
+        // why we asked Adoptium for 17 (or whichever LTS) instead of 16.
         LaunchError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("No Adoptium release found for Java {major_version} on {os}/{arch}"),
+            format!(
+                "No Adoptium release found for Java {adoptium_version} \
+                 (requested {major_version}) on {os}/{arch}"
+            ),
         ))
     })?;
 
@@ -512,6 +577,86 @@ mod tests {
         let (comp, major) = java_component(&opts, &vj);
         assert_eq!(comp, "jre-21");
         assert_eq!(major, 21);
+    }
+
+    // ── mojang_runtime_component ──────────────────────────────────────────────
+
+    /// Regression: 1.17's version JSON says
+    /// `{"component":"java-runtime-alpha","majorVersion":16}`. The old
+    /// `jre-{major}` synthesis returned `jre-16`, which doesn't exist in
+    /// Mojang's all.json (the key is the component name). The lookup
+    /// missed, the launcher fell through to Adoptium with major=16, and
+    /// crashed with "No Adoptium release found for Java 16" (Temurin
+    /// dropped 16 from LTS). The new helper returns the real component.
+    #[test]
+    fn mojang_runtime_component_uses_json_component_field() {
+        use crate::models::minecraft::JavaVersionInfo;
+        let opts = bare_options();
+        let mut vj = bare_version();
+        vj.java_version = Some(JavaVersionInfo {
+            component: Some("java-runtime-alpha".into()),
+            major_version: Some(16),
+        });
+        assert_eq!(mojang_runtime_component(&opts, &vj), "java-runtime-alpha");
+    }
+
+    #[test]
+    fn mojang_runtime_component_legacy_falls_back_to_jre_major() {
+        // Old version JSONs without a `component` field fall back to
+        // the synthesised `jre-{major}`.
+        use crate::models::minecraft::JavaVersionInfo;
+        let opts = bare_options();
+        let mut vj = bare_version();
+        vj.java_version = Some(JavaVersionInfo {
+            component: None,
+            major_version: Some(8),
+        });
+        assert_eq!(mojang_runtime_component(&opts, &vj), "jre-8");
+    }
+
+    #[test]
+    fn mojang_runtime_component_uses_java_option_override() {
+        use crate::models::minecraft::JavaVersionInfo;
+        let mut opts = bare_options();
+        opts.java.version = Some("21".into());
+        let mut vj = bare_version();
+        vj.java_version = Some(JavaVersionInfo {
+            component: Some("java-runtime-gamma".into()),
+            major_version: Some(17),
+        });
+        assert_eq!(mojang_runtime_component(&opts, &vj), "jre-21");
+    }
+
+    #[test]
+    fn mojang_runtime_component_no_java_version_defaults_to_jre_8() {
+        let opts = bare_options();
+        let vj = bare_version();
+        assert_eq!(mojang_runtime_component(&opts, &vj), "jre-8");
+    }
+
+    // ── adoptium_major_version ────────────────────────────────────────────────
+
+    #[test]
+    fn adoptium_substitutes_non_lts_to_next_lts() {
+        // 1.17 wants Java 16 (dropped from LTS in 2024) → 17.
+        assert_eq!(adoptium_major_version(16), 17);
+        // 1.13/1.14/1.15 want Java 8 — already LTS, no substitution.
+        assert_eq!(adoptium_major_version(8), 8);
+        assert_eq!(adoptium_major_version(11), 11);
+        assert_eq!(adoptium_major_version(17), 17);
+        assert_eq!(adoptium_major_version(21), 21);
+        assert_eq!(adoptium_major_version(25), 25);
+        // Non-LTS in the gap between LTS releases → next LTS at or above.
+        assert_eq!(adoptium_major_version(9), 11);
+        assert_eq!(adoptium_major_version(10), 11);
+        assert_eq!(adoptium_major_version(12), 17);
+        assert_eq!(adoptium_major_version(15), 17);
+        assert_eq!(adoptium_major_version(18), 21);
+        assert_eq!(adoptium_major_version(20), 21);
+        assert_eq!(adoptium_major_version(22), 25);
+        assert_eq!(adoptium_major_version(24), 25);
+        // Way above current LTS — fall back to the newest known.
+        assert_eq!(adoptium_major_version(99), 25);
     }
 
     #[test]

@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::game::libraries::natives_base_dir;
 use crate::launcher::options::LaunchOptions;
 use crate::models::loader::LoaderType;
 use crate::models::minecraft::{AssetItem, GameArgEntry, MinecraftVersionJson};
-use crate::game::libraries::natives_base_dir;
 
 // ── Loader context ────────────────────────────────────────────────────────────
 
@@ -154,12 +154,7 @@ pub fn get_jvm_arguments(
             let natives_base_str = natives_base_dir(options, version_json)
                 .to_string_lossy()
                 .into_owned();
-            let ph = build_jvm_placeholders(
-                options,
-                version_json,
-                &natives_base_str,
-                "",
-            );
+            let ph = build_jvm_placeholders(options, version_json, &natives_base_str, "");
 
             let mut skip_next = false;
             for val in jvm_entries {
@@ -987,13 +982,10 @@ mod tests {
         vj.arguments = Some(Arguments {
             game: None,
             jvm: Some(vec![
-                serde_json::Value::String(
-                    "-Djava.library.path=${natives_directory}/java".into(),
-                ),
+                serde_json::Value::String("-Djava.library.path=${natives_directory}/java".into()),
                 serde_json::Value::String("-Djna.tmpdir=${natives_directory}/jna".into()),
                 serde_json::Value::String(
-                    "-Dorg.lwjgl.system.SharedLibraryExtractPath=${natives_directory}/lwjgl"
-                        .into(),
+                    "-Dorg.lwjgl.system.SharedLibraryExtractPath=${natives_directory}/lwjgl".into(),
                 ),
                 serde_json::Value::String(
                     "-Dio.netty.native.workdir=${natives_directory}/netty".into(),
@@ -1040,16 +1032,12 @@ mod tests {
         // (the placeholder expanded to the final path, then `/jna` was
         // appended on top), so neither was the right sibling.
         let last = |prefix: &str| -> Option<&str> {
-            args.iter()
-                .rev()
-                .find_map(|a| a.strip_prefix(prefix))
+            args.iter().rev().find_map(|a| a.strip_prefix(prefix))
         };
         let jna = last("-Djna.tmpdir=").expect("missing -Djna.tmpdir");
-        let lwjgl =
-            last("-Dorg.lwjgl.system.SharedLibraryExtractPath=")
-                .expect("missing SharedLibraryExtractPath");
-        let netty =
-            last("-Dio.netty.native.workdir=").expect("missing netty workdir");
+        let lwjgl = last("-Dorg.lwjgl.system.SharedLibraryExtractPath=")
+            .expect("missing SharedLibraryExtractPath");
+        let netty = last("-Dio.netty.native.workdir=").expect("missing netty workdir");
         assert!(
             jna.ends_with("/natives/jna"),
             "last -Djna.tmpdir must end in /natives/jna, got {jna:?}"
