@@ -483,6 +483,7 @@ mod tests {
     use std::io::Write;
     use tempfile::TempDir;
 
+    use crate::game::arguments::get_jvm_arguments;
     use crate::launcher::options::{JavaOptions, LoaderConfig, MemoryConfig, ScreenConfig};
     use crate::models::minecraft::{
         ArtifactInfo, Authenticator, DownloadArtifact, LibraryDownloads, VersionDownloads,
@@ -720,8 +721,7 @@ mod tests {
         let mut libs = Vec::new();
         for classifier in candidates {
             let lib_name = format!("org.lwjgl:lwjgl:3.3.1:{classifier}");
-            let jar_path =
-                format!("org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1-{classifier}.jar");
+            let jar_path = format!("org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1-{classifier}.jar");
             libs.push(Library {
                 name: lib_name,
                 rules: Some(vec![crate::utils::platform::LibraryRule {
@@ -1169,5 +1169,238 @@ mod tests {
             !natives_root.join("liblwjgl.so").exists(),
             "must not be left at the natives root for modern versions"
         );
+    }
+
+    /// Regression for MC 26.x: end-to-end check that the arch filter and the
+    /// `/java` subdir detection cooperate correctly. On 26.x the version
+    /// JSON ships natives for all three Windows archs
+    /// (`natives-windows`, `natives-windows-x86`, `natives-windows-arm64`)
+    /// and points `-Djava.library.path` at `<natives>/java`. The bundle
+    /// must contain only the host's arch variant, and it must extract to
+    /// the same directory the JVM searches.
+    ///
+    /// OS-agnostic: we build the natives for the current OS (with the
+    /// same permissive `os.name` rule as the real JSON), and the
+    /// assertions key off the host's arch. Runs on every platform.
+    #[tokio::test]
+    async fn mc_26x_arch_filter_and_java_subdir_cooperate() {
+        let dir = TempDir::new().unwrap();
+        let mut vj = version_with_java_subdir("26.2");
+
+        let current_os = mojang_os();
+        let candidates: &[&str] = match current_os {
+            "windows" => &[
+                "natives-windows",
+                "natives-windows-x86",
+                "natives-windows-arm64",
+            ],
+            "linux" => &["natives-linux"], // 26.x doesn't ship aarch64 Linux natives
+            "osx" => &["natives-macos", "natives-macos-arm64"],
+            _ => &["natives-windows"],
+        };
+        let expected_classifier = match (current_os, mojang_arch()) {
+            ("windows", "x86") => "natives-windows-x86",
+            ("windows", "aarch64") => "natives-windows-arm64",
+            ("windows", _) => "natives-windows", // x86_64 default
+            ("osx", "aarch64") => "natives-macos-arm64",
+            ("osx", _) => "natives-macos",
+            _ => candidates[0],
+        };
+
+        for classifier in candidates {
+            let lib_name = format!("org.lwjgl:lwjgl:3.4.1:{classifier}");
+            let jar_path = format!("org/lwjgl/lwjgl/3.4.1/lwjgl-3.4.1-{classifier}.jar");
+            vj.libraries.push(Library {
+                name: lib_name,
+                rules: Some(vec![crate::utils::platform::LibraryRule {
+                    action: crate::utils::platform::RuleAction::Allow,
+                    os: Some(crate::utils::platform::OsRule {
+                        name: Some(current_os.into()),
+                        version: None,
+                        arch: None,
+                    }),
+                    features: None,
+                }]),
+                natives: None,
+                downloads: Some(LibraryDownloads {
+                    artifact: Some(artifact(
+                        &jar_path,
+                        &format!("https://example.com/{jar_path}"),
+                    )),
+                    classifiers: None,
+                }),
+                url: None,
+                loader: None,
+            });
+        }
+
+        let options = opts(dir.path().to_path_buf());
+
+        // (a) Arch filter: only the host's variant reaches the bundle.
+        let items = get_libraries(&options, &vj);
+        let native_files: Vec<String> = items
+            .iter()
+            .filter_map(|i| match i {
+                AssetItem::NativeAsset { path, .. } => std::path::Path::new(path)
+                    .file_name()
+                    .map(|f| f.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            native_files.len(),
+            1,
+            "26.x: expected exactly 1 {current_os} native, got {native_files:?}"
+        );
+        assert!(
+            native_files[0].contains(expected_classifier),
+            "wrong arch for host {}: got {}, want {expected_classifier}",
+            mojang_arch(),
+            native_files[0]
+        );
+
+        // (b) JVM search path agrees with extraction target. This is the
+        //     smoke test from plan §4.4 — `natives_dir_for` and the value
+        //     `get_jvm_arguments` will pass to `-Djava.library.path` must
+        //     be byte-identical, otherwise MC 26.x breaks with
+        //     "Failed to locate library" because the JVM searches
+        //     `natives/` while extraction wrote to `natives/java/`.
+        let extraction_dir = natives_dir_for(&options, &vj);
+        let natives_str = extraction_dir.to_string_lossy().into_owned();
+        // `get_jvm_arguments` is the actual consumer — invoke it and
+        // verify the resulting `-Djava.library.path` flag points at
+        // exactly the same directory.
+        let jvm_args = get_jvm_arguments(
+            &options,
+            &vj,
+            &extraction_dir,
+            None, // no loader context
+        );
+        let jvm_lib_path = jvm_args
+            .iter()
+            .find_map(|a| a.strip_prefix("-Djava.library.path="))
+            .unwrap_or_else(|| panic!("no -Djava.library.path in {jvm_args:?}"));
+        assert_eq!(
+            jvm_lib_path, natives_str,
+            "extraction dir and JVM -Djava.library.path must match for 26.x"
+        );
+        assert!(
+            extraction_dir.ends_with("versions/26.2/natives/java"),
+            "26.x dir must end in /natives/java, got {}",
+            extraction_dir.display()
+        );
+
+        // (c) The single surviving native actually extracts to that
+        //     subdir. This is the original f814884 regression — make
+        //     sure flattening + subdir still work after the arch filter
+        //     is applied.
+        let jar_path = dir.path().join("native.jar");
+        {
+            use zip::write::SimpleFileOptions;
+            let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            let o = SimpleFileOptions::default();
+            // LWJGL 3.4 layout: nested under <os>/<arch>/…
+            let (nested_path, _file_name) = match current_os {
+                "windows" => ("windows/x64/org/lwjgl/lwjgl.dll".to_string(), "lwjgl.dll"),
+                "linux" => ("linux/x64/org/lwjgl/liblwjgl.so".to_string(), "liblwjgl.so"),
+                "osx" => (
+                    "osx/x64/org/lwjgl/liblwjgl.dylib".to_string(),
+                    "liblwjgl.dylib",
+                ),
+                _ => ("linux/x64/org/lwjgl/liblwjgl.so".to_string(), "liblwjgl.so"),
+            };
+            w.start_file(&nested_path, o).unwrap();
+            w.write_all(b"native").unwrap();
+            let finished = w.finish().unwrap();
+            std::fs::write(&jar_path, finished.get_ref()).unwrap();
+        }
+        let bundle = vec![AssetItem::NativeAsset {
+            path: jar_path.to_string_lossy().into_owned(),
+            sha1: String::new(),
+            size: 0,
+            url: String::new(),
+        }];
+        extract_natives(&options, &vj, &bundle).await.unwrap();
+
+        // Whatever the per-OS binary name, it must end up under /java/
+        // (not at the root, which is what 26.x's JVM doesn't search).
+        let java_subdir = dir
+            .path()
+            .join("versions")
+            .join("26.2")
+            .join("natives")
+            .join("java");
+        let natives_root = dir.path().join("versions").join("26.2").join("natives");
+        let files_in_subdir = std::fs::read_dir(&java_subdir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+                    .count()
+            })
+            .unwrap_or(0);
+        assert!(
+            files_in_subdir >= 1,
+            "expected at least one file under {}",
+            java_subdir.display()
+        );
+        // The flattened file must NOT also exist at the natives root
+        // (the original f814884 regression for the /java subdir).
+        let has_root_files = std::fs::read_dir(&natives_root)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.file_type().map(|t| t.is_file()).unwrap_or(false)
+                            && !e.file_name().to_string_lossy().starts_with(".")
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            has_root_files,
+            0,
+            "26.x: natives root {} must be empty (extraction goes to /java)",
+            natives_root.display()
+        );
+    }
+
+    /// Regression for the macOS classifier spelling: 26.x's JSON uses
+    /// `natives-macos` / `natives-macos-arm64` in the classifier but
+    /// `os.name: "osx"` in the rules (Mojang's two conventions live side
+    /// by side). The arch filter must accept both spellings and not
+    /// double-count or skip natives because of the mismatch.
+    #[test]
+    fn macos_classifier_uses_macos_not_osx() {
+        // Classifier `natives-macos-arm64` on aarch64 → must match.
+        assert!(native_classifier_arch_matches_for(
+            "org.lwjgl:lwjgl:3.4.1:natives-macos-arm64",
+            "aarch64"
+        ));
+        // Classifier `natives-macos-arm64` on x86_64 → must NOT match.
+        assert!(!native_classifier_arch_matches_for(
+            "org.lwjgl:lwjgl:3.4.1:natives-macos-arm64",
+            "x86_64"
+        ));
+        // Classifier `natives-macos` (no suffix, defaults to x86_64) on
+        // aarch64 → must NOT match. Otherwise we'd load the x86_64
+        // binary on Apple Silicon.
+        assert!(!native_classifier_arch_matches_for(
+            "org.lwjgl:lwjgl:3.4.1:natives-macos",
+            "aarch64"
+        ));
+        // Classifier `natives-macos` on x86_64 → must match.
+        assert!(native_classifier_arch_matches_for(
+            "org.lwjgl:lwjgl:3.4.1:natives-macos",
+            "x86_64"
+        ));
+        // `natives-osx` (old spelling) is also accepted as a known OS,
+        // for forward/backward compatibility with mixed JSONs.
+        assert!(native_classifier_arch_matches_for(
+            "com.mojang:jtracy:1.0.37:natives-osx",
+            "x86_64"
+        ));
+        assert!(!native_classifier_arch_matches_for(
+            "com.mojang:jtracy:1.0.37:natives-osx",
+            "aarch64"
+        ));
     }
 }
