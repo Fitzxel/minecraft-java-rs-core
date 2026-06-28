@@ -8,7 +8,7 @@ use crate::launcher::options::LaunchOptions;
 use crate::models::minecraft::{ArtifactInfo, AssetItem, Library, MinecraftVersionJson};
 use crate::net::http::fetch_json;
 use crate::utils::paths::get_path_libraries;
-use crate::utils::platform::{mojang_os, skip_library};
+use crate::utils::platform::{mojang_arch, mojang_os, skip_library};
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -56,6 +56,17 @@ pub fn get_libraries(
         } else {
             // ── Regular branch ───────────────────────────────────────────────
             if skip_library(lib.rules.as_deref().unwrap_or(&[])) {
+                continue;
+            }
+
+            // Modern natives (1.19+) are classifier-based (`natives-<os>[-<arch>]`)
+            // with rules that match every Windows / Linux / macOS. Without this
+            // filter, the bundle would include every arch variant (e.g.
+            // `natives-windows`, `natives-windows-x86`, `natives-windows-arm64`),
+            // all of which flatten to the same file name on extraction and
+            // overwrite each other — the last-written (usually the wrong arch)
+            // is what the JVM ends up loading.
+            if !native_classifier_arch_matches(&lib.name) {
                 continue;
             }
 
@@ -194,6 +205,72 @@ fn natives_library_subdir(version_json: &MinecraftVersionJson) -> Option<String>
         };
     }
     None
+}
+
+/// Should the natives library with the given Maven coordinate be included on
+/// the current host? Returns `true` when the library should be downloaded and
+/// extracted.
+///
+/// Mojang's version JSON lists every `(os, arch)` variant of the natives
+/// (e.g. `natives-windows`, `natives-windows-x86`, `natives-windows-arm64`)
+/// with the same permissive rule (`os.name: windows`, `arch: null`) — the
+/// arch filtering is encoded in the classifier itself, not the rule. Without
+/// this check the bundle would include every arch variant and their binaries
+/// would overwrite each other on extraction (the JVM would then load the
+/// last-written one, typically the wrong arch).
+///
+/// Classifier grammar:
+/// - `natives-<os>`           → default arch (`x86_64`).
+/// - `natives-<os>-<suffix>`  → explicit arch; suffix is normalised to one of
+///   `x86`, `x86_64`, `aarch64`, `arm` (Mojang uses several aliases:
+///   `x86_32`, `64`, `arm64`, `aarch64`, `arm32`, `arm`, …).
+/// - Anything else (no `natives-` prefix, or unknown suffix) is left to the
+///   rest of the filtering: we only reject **known natives classifiers** that
+///   don't match the host's arch. Non-native libraries and unknown suffixes
+///   pass through.
+///
+/// `true` ⇒ include; `false` ⇒ skip the library entirely.
+fn native_classifier_arch_matches(name: &str) -> bool {
+    native_classifier_arch_matches_for(name, mojang_arch())
+}
+
+/// Like [`native_classifier_arch_matches`], but takes the current arch as an
+/// argument. Exposed for unit tests so the truth table can be exercised on
+/// every arch without spawning a subprocess.
+fn native_classifier_arch_matches_for(name: &str, current_arch: &str) -> bool {
+    let classifier = match name.split(':').nth(3) {
+        Some(c) if c.starts_with("natives-") => c,
+        _ => return true, // not a natives classifier — not our concern
+    };
+
+    // Classifier grammar: `natives-<os>[-<arch>]`. The OS is always the
+    // first segment after `natives-`; the arch (if any) is the second.
+    // We only apply the arch filter to known OSes — `skip_library`
+    // already filters unknown OSes via the `os.name` rule upstream.
+    let (os, arch_suffix) = match classifier.splitn(3, '-').collect::<Vec<_>>().as_slice() {
+        ["natives", os, arch] => (*os, *arch),
+        ["natives", os] => (*os, ""),
+        _ => return true, // malformed — let upstream filters handle it
+    };
+
+    if !matches!(os, "linux" | "windows" | "osx" | "macos") {
+        return true; // unknown OS — skip_library's job, not ours
+    }
+
+    // Normalise Mojang's classifier strings to the vocabulary of
+    // `mojang_arch()` (`x86` | `x86_64` | `aarch64` | `arm`).
+    // Unknown suffixes are excluded — fail-closed so a future classifier
+    // we don't know about doesn't silently load the wrong binary.
+    let classifier_arch = match arch_suffix {
+        "" => "x86_64", // default for the no-suffix variant
+        "x86" | "x86_32" | "32" => "x86",
+        "x64" | "x86_64" | "64" => "x86_64",
+        "arm64" | "aarch64" => "aarch64",
+        "arm" | "arm32" => "arm",
+        _ => return false,
+    };
+
+    classifier_arch == current_arch
 }
 
 /// Extract all native JARs in `bundle` (`NativeAsset` items) into the directory
@@ -605,6 +682,134 @@ mod tests {
     }
 
     #[test]
+    fn get_libraries_filters_natives_by_current_arch() {
+        // Regression: Mojang's 1.20.1 JSON lists every (os, arch) variant
+        // of LWJGL natives with the same `os.name: <os>` rule and no
+        // arch filter — e.g. on Windows, `natives-windows`,
+        // `natives-windows-x86` and `natives-windows-arm64` all enter
+        // the bundle. Their binaries (`*.dll` / `*.so` / `*.dylib`)
+        // flatten to the same name during extraction, so the
+        // last-written one — usually the wrong arch — is what the JVM
+        // loads. After the classifier-arch filter, only the host's
+        // variant survives.
+        //
+        // OS-agnostic: candidates are built from the current OS so
+        // `skip_library` lets them through, then we check that exactly
+        // one (the host's arch) reaches the bundle.
+        let dir = TempDir::new().unwrap();
+        let mut vj = bare_version();
+
+        let current_os = mojang_os();
+        let candidates: &[&str] = match current_os {
+            "windows" => &[
+                "natives-windows",
+                "natives-windows-x86",
+                "natives-windows-arm64",
+            ],
+            "linux" => &[
+                "natives-linux",
+                "natives-linux-aarch64",
+                "natives-linux-arm64",
+            ],
+            "osx" => &["natives-osx", "natives-osx-arm64"],
+            // Unknown OS: fall back to a single classifier so the test
+            // still exercises the path.
+            _ => &["natives-windows"],
+        };
+
+        let mut libs = Vec::new();
+        for classifier in candidates {
+            let lib_name = format!("org.lwjgl:lwjgl:3.3.1:{classifier}");
+            let jar_path =
+                format!("org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1-{classifier}.jar");
+            libs.push(Library {
+                name: lib_name,
+                rules: Some(vec![crate::utils::platform::LibraryRule {
+                    action: crate::utils::platform::RuleAction::Allow,
+                    os: Some(crate::utils::platform::OsRule {
+                        name: Some(current_os.into()),
+                        version: None,
+                        arch: None,
+                    }),
+                    features: None,
+                }]),
+                natives: None,
+                downloads: Some(LibraryDownloads {
+                    artifact: Some(artifact(
+                        &jar_path,
+                        &format!("https://example.com/{jar_path}"),
+                    )),
+                    classifiers: None,
+                }),
+                url: None,
+                loader: None,
+            });
+        }
+        vj.libraries = libs;
+
+        let items = get_libraries(&opts(dir.path().to_path_buf()), &vj);
+        let native_files: Vec<String> = items
+            .iter()
+            .filter_map(|i| match i {
+                AssetItem::NativeAsset { path, .. } => std::path::Path::new(path)
+                    .file_name()
+                    .map(|f| f.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect();
+
+        // Every survivor must be one of the candidates (sanity: no
+        // foreign-OS native leaked through).
+        for file in &native_files {
+            assert!(
+                candidates.iter().any(|c| file.contains(c)),
+                "unexpected native {file}; candidates were {candidates:?}"
+            );
+        }
+
+        // Re-derive the classifier from the file name
+        // (`<artifact>-natives-<os>[-<arch>].jar`) and verify the arch
+        // component matches the host. Mirrors the production helper so
+        // the test stays self-consistent.
+        for file in &native_files {
+            let stem = file.strip_suffix(".jar").unwrap_or(file);
+            let classifier = match stem.split("-natives-").nth(1) {
+                Some(c) => c,
+                None => panic!("native file {file} has no `-natives-` segment"),
+            };
+            let mut parts = classifier.splitn(2, '-');
+            let _os = parts.next().unwrap_or("");
+            let arch_suffix = parts.next().unwrap_or("");
+            let classifier_arch = match arch_suffix {
+                "" => "x86_64",
+                "x86" | "x86_32" | "32" => "x86",
+                "x64" | "x86_64" | "64" => "x86_64",
+                "arm64" | "aarch64" => "aarch64",
+                "arm" | "arm32" => "arm",
+                other => panic!("unexpected arch suffix {other:?} in {file}"),
+            };
+            assert_eq!(
+                classifier_arch,
+                mojang_arch(),
+                "arch mismatch in {file}: classifier says {classifier_arch}, host is {}",
+                mojang_arch()
+            );
+        }
+
+        // Exactly one native must survive: the one matching the host's
+        // arch. All other variants of the same OS are excluded by the
+        // classifier-arch filter.
+        assert_eq!(
+            native_files.len(),
+            1,
+            "expected exactly 1 native for current arch {} on os {}, got {:?}",
+            mojang_arch(),
+            current_os,
+            native_files
+        );
+    }
+
+    #[test]
     fn library_with_url_fallback_builds_url() {
         let dir = TempDir::new().unwrap();
         let mut vj = bare_version();
@@ -622,6 +827,177 @@ mod tests {
             AssetItem::Asset { url, .. } => url.starts_with("https://maven.fabricmc.net"),
             _ => false,
         }));
+    }
+
+    // ── native_classifier_arch_matches ────────────────────────────────────────
+
+    #[test]
+    fn classifier_match_default_x86_64_on_x86_64() {
+        assert!(native_classifier_arch_matches_for(
+            "org.lwjgl:lwjgl:3.3.1:natives-windows",
+            "x86_64"
+        ));
+        assert!(native_classifier_arch_matches_for(
+            "org.lwjgl:lwjgl:3.3.1:natives-linux",
+            "x86_64"
+        ));
+        assert!(native_classifier_arch_matches_for(
+            "org.lwjgl:lwjgl:3.3.1:natives-macos",
+            "x86_64"
+        ));
+    }
+
+    #[test]
+    fn classifier_match_default_arch_skipped_on_non_default_archs() {
+        // The no-suffix variant means "x86_64" — it must NOT be included on
+        // aarch64 (where the explicit `-arm64`/`-aarch64` variant is needed)
+        // or x86 (where `-x86` is needed).
+        for arch in ["x86", "aarch64", "arm"] {
+            assert!(
+                !native_classifier_arch_matches_for("org.lwjgl:lwjgl:3.3.1:natives-linux", arch),
+                "natives-linux must be skipped on arch={arch}"
+            );
+            assert!(
+                !native_classifier_arch_matches_for("org.lwjgl:lwjgl:3.3.1:natives-windows", arch),
+                "natives-windows must be skipped on arch={arch}"
+            );
+        }
+    }
+
+    #[test]
+    fn classifier_match_explicit_x86_aliases() {
+        // All three are equivalent Mojang spellings for x86.
+        for classifier in [
+            "natives-windows-x86",
+            "natives-windows-x86_32",
+            "natives-windows-32",
+        ] {
+            assert!(
+                native_classifier_arch_matches_for(
+                    &format!("org.lwjgl:lwjgl:3.3.1:{classifier}"),
+                    "x86"
+                ),
+                "{classifier} must match arch=x86"
+            );
+            assert!(
+                !native_classifier_arch_matches_for(
+                    &format!("org.lwjgl:lwjgl:3.3.1:{classifier}"),
+                    "x86_64"
+                ),
+                "{classifier} must NOT match arch=x86_64"
+            );
+        }
+    }
+
+    #[test]
+    fn classifier_match_explicit_x86_64_aliases() {
+        for classifier in [
+            "natives-linux-x64",
+            "natives-linux-x86_64",
+            "natives-linux-64",
+        ] {
+            assert!(
+                native_classifier_arch_matches_for(
+                    &format!("org.lwjgl:lwjgl:3.3.1:{classifier}"),
+                    "x86_64"
+                ),
+                "{classifier} must match arch=x86_64"
+            );
+            assert!(
+                !native_classifier_arch_matches_for(
+                    &format!("org.lwjgl:lwjgl:3.3.1:{classifier}"),
+                    "x86"
+                ),
+                "{classifier} must NOT match arch=x86"
+            );
+        }
+    }
+
+    #[test]
+    fn classifier_match_arm_aliases() {
+        for classifier in ["natives-linux-aarch64", "natives-linux-arm64"] {
+            assert!(
+                native_classifier_arch_matches_for(
+                    &format!("org.lwjgl:lwjgl:3.3.1:{classifier}"),
+                    "aarch64"
+                ),
+                "{classifier} must match arch=aarch64"
+            );
+            assert!(
+                !native_classifier_arch_matches_for(
+                    &format!("org.lwjgl:lwjgl:3.3.1:{classifier}"),
+                    "x86_64"
+                ),
+                "{classifier} must NOT match arch=x86_64"
+            );
+        }
+        for classifier in ["natives-linux-arm32", "natives-linux-arm"] {
+            assert!(
+                native_classifier_arch_matches_for(
+                    &format!("org.lwjgl:lwjgl:3.3.1:{classifier}"),
+                    "arm"
+                ),
+                "{classifier} must match arch=arm"
+            );
+            assert!(
+                !native_classifier_arch_matches_for(
+                    &format!("org.lwjgl:lwjgl:3.3.1:{classifier}"),
+                    "aarch64"
+                ),
+                "{classifier} must NOT match arch=aarch64"
+            );
+        }
+    }
+
+    #[test]
+    fn classifier_match_unknown_suffix_is_excluded() {
+        // Known OS + unknown arch suffix: fail-closed so a future
+        // classifier we don't recognise doesn't silently load the wrong
+        // binary. This is the case the user's bug hinges on — Mojang
+        // could add a new arch (riscv64, loongarch64, …) and we'd refuse
+        // to pick the wrong one.
+        assert!(!native_classifier_arch_matches_for(
+            "org.lwjgl:lwjgl:3.3.1:natives-windows-riscv64",
+            "x86_64"
+        ));
+        assert!(!native_classifier_arch_matches_for(
+            "org.lwjgl:lwjgl:3.3.1:natives-linux-loongarch64",
+            "x86_64"
+        ));
+    }
+
+    #[test]
+    fn classifier_match_unknown_os_passes_through() {
+        // Unknown OSes (e.g. `natives-foo-…`) aren't our concern — the
+        // `os.name` rule check in `skip_library` filters them by the
+        // current platform. We must not interfere.
+        assert!(native_classifier_arch_matches_for(
+            "org.lwjgl:lwjgl:3.3.1:natives-foo-32",
+            "x86"
+        ));
+        assert!(native_classifier_arch_matches_for(
+            "org.lwjgl:lwjgl:3.3.1:natives-foo",
+            "x86_64"
+        ));
+    }
+
+    #[test]
+    fn classifier_match_non_native_passes_through() {
+        // Regular libraries (no `natives-` prefix in the classifier) are not
+        // touched by the filter — `is_native=false` upstream.
+        assert!(native_classifier_arch_matches("org.lwjgl:lwjgl:3.3.1"));
+        assert!(native_classifier_arch_matches(
+            "net.java.dev.jna:jna:5.12.1"
+        ));
+        // Non-native classifier (e.g. sources/javadoc) also passes through.
+        assert!(native_classifier_arch_matches(
+            "com.example:lib:1.0:sources"
+        ));
+        assert!(native_classifier_arch_matches(
+            "com.example:lib:1.0:javadoc"
+        ));
+        // Three-segment coordinates (no classifier) are also non-native.
+        assert!(native_classifier_arch_matches("com.example:lib:1.0"));
     }
 
     // ── get_assets_others ─────────────────────────────────────────────────────

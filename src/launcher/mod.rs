@@ -16,7 +16,7 @@ use crate::game::{
     assets::{copy_assets, get_assets},
     bundle::{check_bundle, check_files},
     java::get_java_files,
-    libraries::{extract_natives, get_assets_others, get_libraries},
+    libraries::{extract_natives, get_assets_others, get_libraries, natives_dir_for},
     version::get_version_json,
 };
 use crate::launcher::game_data::{load_game_data, save_game_data, GameData, JavaInfo};
@@ -298,12 +298,12 @@ impl Launcher {
         let options = &self.options;
         let version_json = &game_data.minecraft_json;
 
-        // Natives directory used for -Djava.library.path.
-        let natives_path: PathBuf = options
-            .path
-            .join("versions")
-            .join(&version_json.id)
-            .join("natives");
+        // Natives directory used for -Djava.library.path. Must agree with the
+        // path `extract_natives` writes to — `natives_dir_for` handles both
+        // the legacy `<base>/natives` layout and the MC 26.x / LWJGL 3.4
+        // `<base>/natives/java` subdir, so the JVM's search path and the
+        // extraction target stay in lockstep.
+        let natives_path: PathBuf = natives_dir_for(options, version_json);
 
         // Build the classpath: loader libraries FIRST so Forge/NeoForge classes
         // take precedence over vanilla when there are collisions.
