@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use crate::launcher::options::LaunchOptions;
 use crate::models::loader::LoaderType;
 use crate::models::minecraft::{AssetItem, GameArgEntry, MinecraftVersionJson};
+use crate::game::libraries::natives_base_dir;
 
 // ── Loader context ────────────────────────────────────────────────────────────
 
@@ -139,9 +140,26 @@ pub fn get_jvm_arguments(
     args.push(format!("-Dio.netty.native.workdir={natives_str}"));
 
     // 6. Modern JVM args from the version JSON.
+    //
+    // `${natives_directory}` is the **base** natives dir
+    // (`<path>/versions/<id>/natives`), NOT the per-version subdir
+    // returned by `natives_dir_for`. The JSON templates append a suffix
+    // like `/java` (MC 26.x / LWJGL 3.4) or `/jna`, `/lwjgl`, `/netty`,
+    // so the base is the right anchor — if we substituted the final
+    // path here, `-Djava.library.path=${natives_directory}/java` would
+    // expand to `<base>/java/java` and the JVM would search a
+    // non-existent directory.
     if let Some(arguments) = &version_json.arguments {
         if let Some(jvm_entries) = &arguments.jvm {
-            let ph = build_jvm_placeholders(options, version_json, &natives_str, "");
+            let natives_base_str = natives_base_dir(options, version_json)
+                .to_string_lossy()
+                .into_owned();
+            let ph = build_jvm_placeholders(
+                options,
+                version_json,
+                &natives_base_str,
+                "",
+            );
 
             let mut skip_next = false;
             for val in jvm_entries {
@@ -340,6 +358,14 @@ fn build_game_placeholders<'a>(
     ph
 }
 
+/// Build the placeholder map used to expand `${...}` tokens in the version
+/// JSON's `arguments.jvm` entries.
+///
+/// `natives_str` must be the **base** natives directory
+/// (`<path>/versions/<id>/natives`), not the per-version subdir returned by
+/// `natives_dir_for`. The JSON templates append a suffix themselves
+/// (e.g. `/java` for MC 26.x, `/jna`, `/lwjgl`, `/netty`), so the base is
+/// the correct anchor for `${natives_directory}`.
 fn build_jvm_placeholders<'a>(
     options: &'a LaunchOptions,
     _version_json: &'a MinecraftVersionJson,
@@ -935,5 +961,106 @@ mod tests {
     fn numeric_dot_split_fallback() {
         assert!(version_is_higher("1.10.0", "1.9.0"));
         assert!(!version_is_higher("1.9.0", "1.10.0"));
+    }
+
+    // ── ${natives_directory} placeholder expansion ────────────────────────────
+
+    /// Regression: discovered via real launch of MC 26.2 on Linux.
+    /// Before this fix, `${natives_directory}` was expanded to the **final**
+    /// natives path returned by `natives_dir_for` (e.g. `…/natives/java`).
+    /// The 26.x JSON template is `-Djava.library.path=${natives_directory}/java`,
+    /// so the substitution produced `…/natives/java/java` and the JVM crashed
+    /// with "Failed to locate library: liblwjgl.so" (the second `-D` wins
+    /// and the resulting path doesn't exist).
+    ///
+    /// The placeholder must expand to the **base** path
+    /// (`<path>/versions/<id>/natives`); the JSON template's own `/java`
+    /// suffix then points at the real extraction target.
+    #[test]
+    fn natives_directory_placeholder_expands_to_base_on_modern_versions() {
+        use crate::game::libraries::natives_dir_for;
+        use crate::models::minecraft::Arguments;
+        let opts = make_opts();
+        let mut vj = bare_version();
+        vj.id = "26.2".into();
+        // MC 26.x JVM args (simplified to the natives-related entries).
+        vj.arguments = Some(Arguments {
+            game: None,
+            jvm: Some(vec![
+                serde_json::Value::String(
+                    "-Djava.library.path=${natives_directory}/java".into(),
+                ),
+                serde_json::Value::String("-Djna.tmpdir=${natives_directory}/jna".into()),
+                serde_json::Value::String(
+                    "-Dorg.lwjgl.system.SharedLibraryExtractPath=${natives_directory}/lwjgl"
+                        .into(),
+                ),
+                serde_json::Value::String(
+                    "-Dio.netty.native.workdir=${natives_directory}/netty".into(),
+                ),
+            ]),
+        });
+
+        let natives_path = natives_dir_for(&opts, &vj);
+        let args = get_jvm_arguments(&opts, &vj, &natives_path, None);
+
+        // The launcher's section 5 still adds its own -Djava.library.path
+        // pointing at the final path. Both must agree on the same dir.
+        let java_lib_path_values: Vec<&str> = args
+            .iter()
+            .filter_map(|a| a.strip_prefix("-Djava.library.path="))
+            .collect();
+        assert_eq!(
+            java_lib_path_values.len(),
+            2,
+            "expected 2 -Djava.library.path (launcher + JSON), got {java_lib_path_values:?}"
+        );
+        for v in &java_lib_path_values {
+            assert!(
+                v.ends_with("/natives/java"),
+                "every -Djava.library.path must end in /natives/java, got {v:?}"
+            );
+            assert!(
+                !v.ends_with("/natives/java/java"),
+                "DOUBLE /java BUG: {v:?} — placeholder was expanded to the final path"
+            );
+        }
+        // Both values should be byte-identical.
+        assert_eq!(
+            java_lib_path_values[0], java_lib_path_values[1],
+            "launcher and JSON -Djava.library.path must point to the same dir"
+        );
+
+        // The tmpdir / extract / workdir flags are added by both the
+        // launcher (section 5, points at the final path) and the JSON
+        // (section 6, points at the sibling dir). The JVM honours the
+        // last occurrence, so we check **all** of them and assert that
+        // at least one of them is the correct sibling path. Before this
+        // fix, the JSON-substituted value was `…/natives/java/jna`
+        // (the placeholder expanded to the final path, then `/jna` was
+        // appended on top), so neither was the right sibling.
+        let last = |prefix: &str| -> Option<&str> {
+            args.iter()
+                .rev()
+                .find_map(|a| a.strip_prefix(prefix))
+        };
+        let jna = last("-Djna.tmpdir=").expect("missing -Djna.tmpdir");
+        let lwjgl =
+            last("-Dorg.lwjgl.system.SharedLibraryExtractPath=")
+                .expect("missing SharedLibraryExtractPath");
+        let netty =
+            last("-Dio.netty.native.workdir=").expect("missing netty workdir");
+        assert!(
+            jna.ends_with("/natives/jna"),
+            "last -Djna.tmpdir must end in /natives/jna, got {jna:?}"
+        );
+        assert!(
+            lwjgl.ends_with("/natives/lwjgl"),
+            "last SharedLibraryExtractPath must end in /natives/lwjgl, got {lwjgl:?}"
+        );
+        assert!(
+            netty.ends_with("/natives/netty"),
+            "last -Dio.netty.native.workdir must end in /natives/netty, got {netty:?}"
+        );
     }
 }
